@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Battery Monitor</string>
+
+    <!-- Top bar and actions -->
+    <string name="screen_title">Battery Monitor</string>
+    <string name="action_history">History</string>
+    <string name="action_clear_data">Clear data</string>
+    <string name="action_help">Help</string>
+    <string name="action_close">Close</string>
+
+    <!-- Pull to refresh -->
+    <string name="pull_to_refresh">Pull to refresh</string>
+    <string name="release_to_refresh">Release to refresh</string>
+    <string name="refreshing">Refreshing…</string>
+    <string name="refresh_done">Refresh complete</string>
+
+    <!-- Clear confirmation -->
+    <string name="clear_confirm_title">Clear this session?</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="action_confirm">OK</string>
+
+    <!-- Data source -->
+    <string name="data_source_root">Shizuku (root)</string>
+    <string name="data_source_shell">Shizuku (shell)</string>
+    <string name="data_source_unauthorized">Shizuku (not authorized)</string>
+    <string name="data_source_disconnected">Shizuku (not connected)</string>
+    <string name="daemon_running">running</string>
+    <string name="daemon_stopped">stopped</string>
+    <string name="data_source_line">Source: %1$s · sampler %2$s</string>
+
+    <!-- Card titles -->
+    <string name="card_usage_process">Usage</string>
+    <string name="card_usage_scenarios">Usage scenarios</string>
+
+    <!-- Summary -->
+    <string name="summary_average_power">Avg. power</string>
+    <string name="summary_used">Used</string>
+    <string name="summary_estimated_runtime">Est. runtime</string>
+
+    <!-- Legend -->
+    <string name="legend_title">Help</string>
+    <string name="legend_screen_on">Screen on</string>
+    <string name="legend_screen_off">Screen off</string>
+    <string name="legend_missed_screen_on">Screen on, battery state not recorded</string>
+    <string name="legend_missed_screen_off">Screen off, battery state not recorded</string>
+    <string name="legend_hint_screen_off">While the screen is off this app stops recording battery state to save power, so those stretches are drawn as a dashed grey line.</string>
+    <string name="legend_hint_missed">A dashed blue line means the background process was suspended and could not record at the planned cadence.</string>
+    <string name="legend_got_it">Got it</string>
+
+    <!-- Session history -->
+    <string name="history_title">History</string>
+    <string name="history_empty">No history yet</string>
+    <string name="history_clear">Clear history</string>
+    <string name="history_delete">Delete this record</string>
+
+    <!-- Usage scenarios -->
+    <string name="scenario_toggle_unit_w">Switch to W</string>
+    <string name="scenario_toggle_unit_ma">Switch to mA</string>
+    <string name="scenario_sort_desc">Sorted by power, highest first; tap for lowest first</string>
+    <string name="scenario_sort_asc">Sorted by power, lowest first; tap for highest first</string>
+    <string name="scenario_permission_required">Shizuku permission is required to measure app power usage</string>
+    <string name="scenario_grant">Grant</string>
+    <string name="scenario_loading">Measuring…</string>
+    <string name="scenario_empty">No app usage recorded in the last 45 minutes</string>
+</resources>

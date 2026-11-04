@@ -17,6 +17,8 @@ import androidx.compose.ui.unit.sp
 import dev.shiko.batterymonitor.model.PowerSummary
 import dev.shiko.batterymonitor.util.formatDuration
 import dev.shiko.batterymonitor.util.formatWatts
+import androidx.compose.ui.res.stringResource
+import dev.shiko.batterymonitor.R
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.theme.MiuixTheme
@@ -41,17 +43,17 @@ fun StatSummaryCard(
         ) {
             SummaryColumn(
                 value = formatWatts(summary.averagePowerWatts),
-                label = "平均功耗",
+                label = stringResource(R.string.summary_average_power),
                 modifier = Modifier.weight(1f),
             )
             SummaryColumn(
                 value = formatDuration(summary.usedMillis),
-                label = "已使用",
+                label = stringResource(R.string.summary_used),
                 modifier = Modifier.weight(1f),
             )
             SummaryColumn(
                 value = formatDuration(summary.estimatedRuntimeMillis),
-                label = "理论续航",
+                label = stringResource(R.string.summary_estimated_runtime),
                 modifier = Modifier.weight(1f),
             )
         }

@@ -23,6 +23,7 @@
 | 刷新 | 整页 Miuix PullToRefresh 下拉刷新统计（卡片内不再有刷新按钮） |
 | 历史记录 | 每次清除统计会存档一条：`-x%/h / xW / xWh / xh`，可单条删除或清空 |
 | 说明提示 | 图表虚线含义的说明弹窗（对齐参考图） |
+| 多语言 | 简体中文 / 繁體中文 / English / 日本語；跟随系统语言，Android 13+ 也可在「设置 → 应用 → 耗电统计 → 语言」里单独切换 |
 
 ## 数据来源与算法（对齐 Scene 9.4.18）
 
@@ -87,7 +88,7 @@ adb install -r app/build/outputs/apk/release/app-release.apk
 | 手段 | 效果 |
 | --- | --- |
 | release 开 R8（`optimization.enable = true`），且**不限制 `packageScope`**（默认 `**`） | **8.5 MB → 2.35 MB**，最关键 |
-| `androidResources.localeFilters = ["zh", "en"]`（原来 AndroidX 带上百种语言） | −60 KB |
+| `androidResources.localeFilters = ["zh", "zh-rTW", "en", "ja"]`（原来 AndroidX 带上百种语言） | −60 KB |
 | `packaging.resources.excludes`：META-INF 的许可/`.version` 文件、`DebugProbesKt.bin`、Kotlin builtin 反射元数据 | −23 KB |
 | `ui-tooling-preview` 改成 `debugImplementation` | 不进 release |
 | 只保留 arm64-v8a | 单 ABI 单包 |

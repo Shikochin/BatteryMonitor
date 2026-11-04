@@ -27,6 +27,8 @@ import dev.shiko.batterymonitor.ui.component.SessionHistoryDialog
 import dev.shiko.batterymonitor.ui.component.StatSummaryCard
 import dev.shiko.batterymonitor.ui.component.UsageProcessCard
 import dev.shiko.batterymonitor.ui.component.UsageScenarioCard
+import androidx.compose.ui.res.stringResource
+import dev.shiko.batterymonitor.R
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
@@ -49,7 +51,7 @@ import top.yukonga.miuix.kmp.overlay.OverlayDialog
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
- * Root screen of the app: the "耗电统计" (power consumption statistics) page.
+ * Root screen of the app: the stringResource(R.string.screen_title) (power consumption statistics) page.
  *
  * Structure mirrors the Scene reference:
  *  1. [UsageProcessCard] — curve + telemetry
@@ -110,8 +112,8 @@ fun PowerStatsScreen(
         containerColor = surfaceColor,
         topBar = {
             TopAppBar(
-                title = "耗电统计",
-                largeTitle = "耗电统计",
+                title = stringResource(R.string.screen_title),
+                largeTitle = stringResource(R.string.screen_title),
                 scrollBehavior = scrollBehavior,
                 color = if (backdrop != null) Color.Transparent else surfaceColor,
                 modifier = if (backdrop != null) {
@@ -132,14 +134,14 @@ fun PowerStatsScreen(
                     IconButton(onClick = { showHistory = true }) {
                         Icon(
                             imageVector = MiuixIcons.Light.Recent,
-                            contentDescription = "历史记录",
+                            contentDescription = stringResource(R.string.action_history),
                             modifier = Modifier.size(22.dp),
                         )
                     }
                     IconButton(onClick = { showClearConfirm = true }) {
                         Icon(
                             imageVector = MiuixIcons.Light.Delete,
-                            contentDescription = "清除数据",
+                            contentDescription = stringResource(R.string.action_clear_data),
                             modifier = Modifier.size(22.dp),
                         )
                     }
@@ -163,7 +165,12 @@ fun PowerStatsScreen(
                 // padding below so that cards can slide under the frosted bar.
                 contentPadding = contentPadding,
                 topAppBarScrollBehavior = scrollBehavior,
-                refreshTexts = listOf("下拉刷新", "松开刷新", "正在刷新…", "刷新完成"),
+                refreshTexts = listOf(
+                        stringResource(R.string.pull_to_refresh),
+                        stringResource(R.string.release_to_refresh),
+                        stringResource(R.string.refreshing),
+                        stringResource(R.string.refresh_done),
+                    ),
             ) {
                 Column(
                     modifier = Modifier
@@ -216,7 +223,7 @@ fun PowerStatsScreen(
 
         OverlayDialog(
             show = showClearConfirm,
-            title = "清除本次统计？",
+            title = stringResource(R.string.clear_confirm_title),
             onDismissRequest = { showClearConfirm = false },
         ) {
             Row(
@@ -226,12 +233,12 @@ fun PowerStatsScreen(
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 TextButton(
-                    text = "取消",
+                    text = stringResource(R.string.action_cancel),
                     onClick = { showClearConfirm = false },
                     modifier = Modifier.weight(1f),
                 )
                 TextButton(
-                    text = "确定",
+                    text = stringResource(R.string.action_confirm),
                     onClick = {
                         showClearConfirm = false
                         onClearData()
@@ -258,15 +265,20 @@ private fun DataSourceRow(
     daemonRunning: Boolean,
     modifier: Modifier = Modifier,
 ) {
-    val source = when {
-        // root reads continuous sysfs current; plain shell can only see `dumpsys battery`.
-        shizukuGranted && rootAvailable -> "Shizuku (root)"
-        shizukuGranted -> "Shizuku (shell)"
-        shizukuAvailable -> "Shizuku (未授权)"
-        else -> "Shizuku (未连接)"
-    }
+    val source = stringResource(
+        when {
+            // root reads continuous sysfs current; plain shell can only see `dumpsys battery`.
+            shizukuGranted && rootAvailable -> R.string.data_source_root
+            shizukuGranted -> R.string.data_source_shell
+            shizukuAvailable -> R.string.data_source_unauthorized
+            else -> R.string.data_source_disconnected
+        },
+    )
     // The daemon is what keeps collecting while Android freezes this process in the background.
-    val text = "数据来源：$source · 守护进程${if (daemonRunning) "运行中" else "未运行"}"
+    val daemonState = stringResource(
+        if (daemonRunning) R.string.daemon_running else R.string.daemon_stopped,
+    )
+    val text = stringResource(R.string.data_source_line, source, daemonState)
 
     Box(
         modifier = modifier,

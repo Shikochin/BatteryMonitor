@@ -23,6 +23,8 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.res.stringResource
+import dev.shiko.batterymonitor.R
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.overlay.OverlayDialog
@@ -47,23 +49,23 @@ fun ChartLegendDialog(
     val colors = MiuixTheme.colorScheme
     OverlayDialog(
         show = show,
-        title = "说明提示",
+        title = stringResource(R.string.legend_title),
         onDismissRequest = onDismiss,
     ) {
         Column(modifier = Modifier.fillMaxWidth()) {
-            LegendRow(color = colors.primary, dotted = false, label = "屏幕点亮")
-            LegendRow(color = colors.onSurfaceVariantActions, dotted = false, label = "屏幕关闭")
-            LegendRow(color = colors.primary, dotted = true, label = "屏幕点亮，未记录电池状态")
-            LegendRow(color = colors.onSurfaceVariantActions, dotted = true, label = "屏幕关闭，未记录电池状态")
+            LegendRow(color = colors.primary, dotted = false, label = stringResource(R.string.legend_screen_on))
+            LegendRow(color = colors.onSurfaceVariantActions, dotted = false, label = stringResource(R.string.legend_screen_off))
+            LegendRow(color = colors.primary, dotted = true, label = stringResource(R.string.legend_missed_screen_on))
+            LegendRow(color = colors.onSurfaceVariantActions, dotted = true, label = stringResource(R.string.legend_missed_screen_off))
 
             Spacer(Modifier.height(16.dp))
-            HintParagraph("在手机屏幕关闭时，本应用会停止记录电池状态以减少耗电，在图表中显示为灰色虚线。")
+            HintParagraph(stringResource(R.string.legend_hint_screen_off))
             Spacer(Modifier.height(10.dp))
-            HintParagraph("但如果图表中出现蓝色虚线，说明后台进程被休眠，未能按计划的频率记录电池状态。")
+            HintParagraph(stringResource(R.string.legend_hint_missed))
 
             Spacer(Modifier.height(20.dp))
             TextButton(
-                text = "我知道了",
+                text = stringResource(R.string.legend_got_it),
                 onClick = onDismiss,
                 modifier = Modifier.fillMaxWidth(),
             )

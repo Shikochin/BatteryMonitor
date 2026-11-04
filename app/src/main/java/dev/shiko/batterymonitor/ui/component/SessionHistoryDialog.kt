@@ -23,6 +23,8 @@ import dev.shiko.batterymonitor.model.SessionRecord
 import dev.shiko.batterymonitor.util.formatDuration
 import dev.shiko.batterymonitor.util.formatWattHours
 import dev.shiko.batterymonitor.util.formatWatts
+import androidx.compose.ui.res.stringResource
+import dev.shiko.batterymonitor.R
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.HorizontalDivider
 import top.yukonga.miuix.kmp.basic.Icon
@@ -69,13 +71,13 @@ fun SessionHistoryDialog(
 
     OverlayDialog(
         show = show,
-        title = "历史记录",
+        title = stringResource(R.string.history_title),
         onDismissRequest = onDismiss,
     ) {
         Column(modifier = Modifier.fillMaxWidth()) {
             if (visibleRecords.isEmpty()) {
                 Text(
-                    text = "暂无历史记录",
+                    text = stringResource(R.string.history_empty),
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(vertical = 28.dp),
@@ -109,14 +111,14 @@ fun SessionHistoryDialog(
             ) {
                 if (visibleRecords.isNotEmpty()) {
                     TextButton(
-                        text = "清空历史记录",
+                        text = stringResource(R.string.history_clear),
                         onClick = onClearHistory,
                         modifier = Modifier.weight(1f),
                         colors = ButtonDefaults.textButtonColors(),
                     )
                 }
                 TextButton(
-                    text = "关闭",
+                    text = stringResource(R.string.action_close),
                     onClick = onDismiss,
                     modifier = Modifier.weight(1f),
                     colors = ButtonDefaults.textButtonColorsPrimary(),
@@ -171,7 +173,7 @@ private fun HistoryRow(
         ) {
             Icon(
                 imageVector = MiuixIcons.Light.Delete,
-                contentDescription = "删除这条记录",
+                contentDescription = stringResource(R.string.history_delete),
                 modifier = Modifier.size(22.dp),
                 tint = MiuixTheme.colorScheme.onSurfaceVariantSummary,
             )

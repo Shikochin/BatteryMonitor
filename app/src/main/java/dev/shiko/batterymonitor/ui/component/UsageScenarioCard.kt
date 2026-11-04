@@ -33,6 +33,8 @@ import dev.shiko.batterymonitor.util.formatCelsius
 import dev.shiko.batterymonitor.util.formatDuration
 import dev.shiko.batterymonitor.util.formatMilliAmps
 import dev.shiko.batterymonitor.util.formatWatts
+import androidx.compose.ui.res.stringResource
+import dev.shiko.batterymonitor.R
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.Icon
@@ -127,7 +129,7 @@ private fun ScenarioHeader(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
-            text = "使用场景",
+            text = stringResource(R.string.card_usage_scenarios),
             color = MiuixTheme.colorScheme.onSurface,
             fontSize = 17.sp,
             fontWeight = FontWeight.Medium,
@@ -137,7 +139,11 @@ private fun ScenarioHeader(
         IconButton(onClick = onToggleUnits) {
             Icon(
                 imageVector = MiuixIcons.Regular.Refresh,
-                contentDescription = if (powerInMilliAmps) "切换为 W 单位" else "切换为 mA 单位",
+                contentDescription = if (powerInMilliAmps) {
+                    stringResource(R.string.scenario_toggle_unit_w)
+                } else {
+                    stringResource(R.string.scenario_toggle_unit_ma)
+                },
                 modifier = Modifier.size(22.dp),
                 tint = MiuixTheme.colorScheme.primary,
             )
@@ -145,7 +151,11 @@ private fun ScenarioHeader(
         IconButton(onClick = onToggleSort) {
             Icon(
                 imageVector = MiuixIcons.Regular.Sort,
-                contentDescription = if (sortDescending) "当前按功耗从高到低，点击改为从低到高" else "当前按功耗从低到高，点击改为从高到低",
+                contentDescription = if (sortDescending) {
+                    stringResource(R.string.scenario_sort_desc)
+                } else {
+                    stringResource(R.string.scenario_sort_asc)
+                },
                 modifier = Modifier.size(22.dp),
                 tint = MiuixTheme.colorScheme.primary,
             )
@@ -251,14 +261,14 @@ private fun ShizukuRequestState(
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Text(
-            text = "需要 Shizuku 权限才能统计应用耗电",
+            text = stringResource(R.string.scenario_permission_required),
             color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
             fontSize = 13.sp,
             textAlign = TextAlign.Center,
         )
         Spacer(modifier = Modifier.height(6.dp))
         TextButton(
-            text = "去授权",
+            text = stringResource(R.string.scenario_grant),
             onClick = onRequestShizuku,
             colors = ButtonDefaults.textButtonColorsPrimary(),
         )
@@ -278,7 +288,7 @@ private fun EmptyState(
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Text(
-            text = if (loading) "正在统计…" else "最近 45 分钟内没有应用使用记录",
+            text = if (loading) stringResource(R.string.scenario_loading) else stringResource(R.string.scenario_empty),
             color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
             fontSize = 13.sp,
             textAlign = TextAlign.Center,

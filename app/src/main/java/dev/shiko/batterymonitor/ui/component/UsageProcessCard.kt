@@ -28,6 +28,8 @@ import dev.shiko.batterymonitor.util.formatCelsius
 import dev.shiko.batterymonitor.util.formatVoltage
 import dev.shiko.batterymonitor.util.formatWatts
 import dev.shiko.batterymonitor.util.formatWattHours
+import androidx.compose.ui.res.stringResource
+import dev.shiko.batterymonitor.R
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.Text
@@ -65,7 +67,7 @@ fun UsageProcessCard(
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
-                text = "使用过程",
+                text = stringResource(R.string.card_usage_process),
                 fontSize = 17.sp,
                 fontWeight = FontWeight.Medium,
                 color = colors.onSurface,
@@ -108,7 +110,7 @@ private fun HelpButton(onClick: () -> Unit) {
     Text(
         text = "?",
         modifier = Modifier
-            .clickable(onClickLabel = "说明提示", onClick = onClick)
+            .clickable(onClickLabel = stringResource(R.string.action_help), onClick = onClick)
             .padding(horizontal = 6.dp, vertical = 2.dp),
         fontSize = 16.sp,
         fontWeight = FontWeight.Bold,
