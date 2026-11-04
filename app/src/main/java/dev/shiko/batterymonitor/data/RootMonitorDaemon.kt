@@ -146,7 +146,7 @@ internal class RootMonitorDaemon(context: Context) {
         if (!logFile.exists()) return@runCatching Batch(emptyList(), fromOffset)
         RandomAccessFile(logFile, "r").use { file ->
             val size = file.length()
-            val start = if (fromOffset in 0 until size) fromOffset else 0L
+            val start = if (fromOffset in 0..size) fromOffset else 0L
             if (size <= start) return@runCatching Batch(emptyList(), size)
             val length = minOf(size - start, MAX_BATCH_BYTES.toLong()).toInt()
             val buffer = ByteArray(length)
