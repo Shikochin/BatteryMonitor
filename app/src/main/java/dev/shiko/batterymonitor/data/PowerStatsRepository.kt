@@ -97,6 +97,10 @@ class PowerStatsRepository(context: Context) {
     private var counterReferenceAtMillis: Long = 0L
     private var lastValidPowerWatts: Float? = null
 
+    /** Raw-to-mA divisor locked by the calibrator, reused until the counter corrects it. */
+    private var lockedCurrentDivisor: Float? = null
+    private var lastCurrentSource: CurrentSource = CurrentSource.COUNTER
+
     // --- chart ------------------------------------------------------------------------------------
     private val windowSamples = mutableListOf<PowerSample>()
     private var chartSamples: List<ChartSample> = emptyList()
@@ -115,6 +119,8 @@ class PowerStatsRepository(context: Context) {
     private var shizukuAvailable: Boolean = false
     private var shizukuGranted: Boolean = false
     private var rootAvailable: Boolean = false
+    /** Consecutive ticks where the sysfs read failed while root was assumed. */
+    private var sysfsFailureStreak: Int = 0
     private var shizukuPermissionRequested: Boolean = false
     private var lastPermissionCheckMillis: Long = 0L
 
@@ -349,6 +355,7 @@ class PowerStatsRepository(context: Context) {
         lastPowerDump = null
         lastValidPowerWatts = null
         counterReferenceWatts = null
+        lockedCurrentDivisor = null
         counterAnchorMicroAmpHours = null
         scenarios = emptyList()
         visualCache = emptyMap()
@@ -411,18 +418,78 @@ class PowerStatsRepository(context: Context) {
         }
     }
 
+    /**
+     * One battery read per tick, picking the most direct current source available:
+     * a) sysfs `current_now` (root), b) `BatteryManager.CURRENT_NOW` (public API, no root),
+     * c) the OPLUS `Battery current` line of `dumpsys battery`, d) none → the counter anchor is
+     * used later as a fallback.
+     */
     private suspend fun readBattery(): RawBatteryReading? {
-        if (rootAvailable) {
-            val sysfs = withContext(Dispatchers.IO) {
-                val text = ShizukuBridge.exec(SysfsBatterySource.COMMAND)
-                SysfsBatterySource.parse(text)
+        // Root detection is sticky but re-checked every tick: uid 0 *or* a successful sysfs read
+        // means root (Sui can grant root asynchronously), and only repeated failures downgrade.
+        val uidIsRoot = ShizukuBridge.serverUid() == 0
+        val sysfs = withContext(Dispatchers.IO) {
+            val text = ShizukuBridge.exec(SysfsBatterySource.COMMAND)
+            SysfsBatterySource.parse(text)
+        }
+        val sysfsUsable = sysfs != null && sysfs.rawCurrent != null
+        if (uidIsRoot || sysfsUsable) {
+            rootAvailable = true
+            sysfsFailureStreak = 0
+        } else if (rootAvailable) {
+            sysfsFailureStreak++
+            if (sysfsFailureStreak >= ROOT_DOWNGRADE_FAILURES) {
+                rootAvailable = false
+                sysfsFailureStreak = 0
+                lockedCurrentDivisor = null
             }
-            if (sysfs != null) return sysfs
+        } else {
+            rootAvailable = false
         }
-        return withContext(Dispatchers.IO) {
-            val text = ShizukuBridge.exec("dumpsys battery")
-            SystemBatteryStatsSource.parseBatteryDump(text)?.toRawReading()
+
+        // Public API, cheap and synchronous: the preferred source when sysfs is not readable.
+        val managerRaw = sampler.readCurrentNowRaw()
+
+        val dump = if (sysfsUsable) {
+            null
+        } else {
+            withContext(Dispatchers.IO) {
+                val text = ShizukuBridge.exec("dumpsys battery")
+                SystemBatteryStatsSource.parseBatteryDump(text)
+            }
         }
+
+        val base = (if (sysfsUsable) sysfs else null) ?: dump?.toRawReading() ?: return null
+        val rawCurrent: Long?
+        val source: CurrentSource
+        when {
+            sysfsUsable -> {
+                rawCurrent = sysfs.rawCurrent
+                source = CurrentSource.SYSFS
+            }
+
+            managerRaw != null -> {
+                rawCurrent = managerRaw
+                source = CurrentSource.BATTERY_MANAGER
+            }
+
+            base.rawCurrent != null -> {
+                rawCurrent = base.rawCurrent
+                source = CurrentSource.DUMPSYS
+            }
+
+            else -> {
+                rawCurrent = null
+                source = CurrentSource.COUNTER
+            }
+        }
+        lastCurrentSource = source
+        android.util.Log.d(
+            "PowerSource",
+            "mode=${if (rootAvailable) "root" else "shell"} source=${source.name.lowercase()} " +
+                "raw=$rawCurrent v=${base.voltageVolts} status=${base.status}",
+        )
+        return base.copy(rawCurrent = rawCurrent)
     }
 
     /**
@@ -441,7 +508,9 @@ class PowerStatsRepository(context: Context) {
             } else {
                 val elapsedMillis = nowMillis - anchorAt
                 val deltaMicroAmpHours = abs(counter - anchor)
-                if (elapsedMillis >= MIN_COUNTER_WINDOW_MILLIS && deltaMicroAmpHours > 0L) {
+                if (elapsedMillis >= MIN_COUNTER_WINDOW_MILLIS &&
+                    deltaMicroAmpHours >= MIN_COUNTER_DELTA_MICRO_AMP_HOURS
+                ) {
                     val hours = elapsedMillis / 3_600_000f
                     if (hours > 0f) {
                         val watts = deltaMicroAmpHours / 1_000_000f * raw.voltageVolts / hours
@@ -461,24 +530,39 @@ class PowerStatsRepository(context: Context) {
     }
 
     /**
-     * Turns a raw reading into a calibrated one. Nothing is returned until the charge-counter
-     * reference exists; when the raw sensor is missing, the counter power itself implies the current.
+     * Turns a raw reading into a calibrated one for **this tick**.
+     *
+     * A power inside the sane range is produced immediately: the charge counter only picks between
+     * the unit interpretations (and its absence locks a plausible scale until it can correct it).
+     * The counter value itself is only used when there is no raw current at all.
      */
     private fun calibrateReading(raw: RawBatteryReading, referencePowerWatts: Float?): BatteryReading? {
         val discharging = raw.discharging
-        val calibratedCurrent: Float = raw.rawCurrent?.let { rawCurrent ->
+        var sensorPowerWatts: Float? = null
+
+        val sensorCurrent: Float? = raw.rawCurrent?.let { rawCurrent ->
             CurrentCalibrator.calibrate(
                 rawCurrent = rawCurrent,
                 voltageVolts = raw.voltageVolts,
                 referencePowerWatts = referencePowerWatts,
                 discharging = discharging,
-            )?.milliAmps
-        } ?: referencePowerWatts?.let {
-            CurrentCalibrator.currentFromPower(it, raw.voltageVolts, discharging)
-        } ?: return null
+                preferredDivisor = lockedCurrentDivisor,
+            )?.also { calibration ->
+                lockedCurrentDivisor = calibration.divisor
+                sensorPowerWatts = calibration.powerWatts
+            }?.milliAmps
+        }
 
-        val powerWatts = abs(calibratedCurrent) * raw.voltageVolts / 1000f
+        val calibratedCurrent: Float = sensorCurrent
+            ?: referencePowerWatts?.let {
+                CurrentCalibrator.currentFromPower(it, raw.voltageVolts, discharging)
+            }
+            ?: return null
+
+        val powerWatts = sensorPowerWatts
+            ?: (abs(calibratedCurrent) * raw.voltageVolts / 1000f)
         if (powerWatts < PowerMath.MIN_POWER_WATTS || powerWatts > PowerMath.MAX_POWER_WATTS) return null
+
         return BatteryReading(
             levelPercent = raw.levelPercent,
             voltageVolts = raw.voltageVolts,
@@ -1096,14 +1180,23 @@ class PowerStatsRepository(context: Context) {
         const val SESSION_MAX_GAP_MILLIS = 24L * 60L * 60_000L
         const val SESSION_LEVEL_RISE_GAP_MILLIS = 30_000L
 
-        /** Minimum window for the charge-counter reference power (current calibration). */
-        const val MIN_COUNTER_WINDOW_MILLIS = 5_000L
+        /** Counter reference window: one tick, so the calibration can follow quickly. */
+        const val MIN_COUNTER_WINDOW_MILLIS = 3_000L
+
+        /** Only a full 1 mAh step is meaningful (the gauge resolution). */
+        const val MIN_COUNTER_DELTA_MICRO_AMP_HOURS = 1_000L
 
         /** A counter reference older than this is stale and no longer used for calibration. */
         const val COUNTER_REFERENCE_VALIDITY_MILLIS = 120_000L
 
-        /** Periodic Shizuku re-check (once per tick at 3 s). */
-        const val PERMISSION_CHECK_INTERVAL_MILLIS = 3_000L
+        /**
+         * Root is sticky: a single failed sysfs read (service restart, SELinux hiccup) must not flip
+         * the power source back and forth.
+         */
+        const val ROOT_DOWNGRADE_FAILURES = 5
+
+        /** Shizuku/root re-check runs on every 3 s tick (root can appear asynchronously). */
+        const val PERMISSION_CHECK_INTERVAL_MILLIS = 1_000L
 
         /** Give `dumpsys batterystats --reset` a moment before reading the counters back. */
         const val SCENARIO_REFRESH_AFTER_RESET_MILLIS = 800L

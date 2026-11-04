@@ -13,6 +13,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -20,7 +21,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.shiko.batterymonitor.model.PowerUiState
@@ -32,6 +32,7 @@ import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
+import top.yukonga.miuix.kmp.basic.PullToRefresh
 import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
@@ -71,7 +72,13 @@ fun PowerStatsScreen(
 ) {
     var showHistory by remember { mutableStateOf(false) }
     var showClearConfirm by remember { mutableStateOf(false) }
+    var refreshing by remember { mutableStateOf(false) }
     val scrollBehavior = MiuixScrollBehavior()
+
+    // The pull-to-refresh indicator stays up until the repository has re-read the stats.
+    LaunchedEffect(state.loadingScenarios) {
+        if (!state.loadingScenarios) refreshing = false
+    }
 
     Scaffold(
         modifier = modifier,
@@ -100,15 +107,25 @@ fun PowerStatsScreen(
             )
         },
     ) { contentPadding ->
-        Column(
+        PullToRefresh(
+            isRefreshing = refreshing,
+            onRefresh = {
+                refreshing = true
+                onRefreshScenarios()
+            },
             modifier = Modifier
                 .fillMaxSize()
-                .padding(contentPadding)
-                .nestedScroll(scrollBehavior.nestedScrollConnection)
-                .verticalScroll(rememberScrollState())
-                .padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 24.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+                .padding(contentPadding),
+            topAppBarScrollBehavior = scrollBehavior,
+            refreshTexts = listOf("下拉刷新", "松开刷新", "正在刷新…", "刷新完成"),
         ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 24.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
             UsageProcessCard(
                 state = state,
                 modifier = Modifier.fillMaxWidth(),
@@ -124,7 +141,6 @@ fun PowerStatsScreen(
                 needsShizuku = !state.shizukuGranted,
                 loading = state.loadingScenarios,
                 onRequestShizuku = onRequestShizuku,
-                onRefresh = onRefreshScenarios,
                 modifier = Modifier.fillMaxWidth(),
             )
             DataSourceRow(
@@ -136,6 +152,7 @@ fun PowerStatsScreen(
                     .fillMaxWidth()
                     .padding(top = 4.dp),
             )
+            }
         }
 
         // Dialogs live inside the Scaffold content so they attach to the Scaffold's popup host.
@@ -198,10 +215,12 @@ private fun DataSourceRow(
             contentAlignment = Alignment.Center,
         ) {
             Text(
+                // root reads continuous sysfs current (3 s cadence); shell can only see the
+                // charge counter, which this ROM republishes about every 16 s.
                 text = if (rootAvailable) {
-                    "数据来源：Shizuku (root) · 系统电池统计"
+                    "数据来源：Shizuku (root) · 实时"
                 } else {
-                    "数据来源：Shizuku (shell) · 系统电池统计"
+                    "数据来源：Shizuku (shell) · 约 16 秒刷新，Sui 授予 root 可实时"
                 },
                 color = color,
                 fontSize = 12.sp,

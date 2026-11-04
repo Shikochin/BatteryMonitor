@@ -61,7 +61,6 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
  * @param needsShizuku whether the Shizuku permission still has to be granted.
  * @param loading whether the breakdown is currently being computed.
  * @param onRequestShizuku asks Shizuku for the permission ("去授权").
- * @param onRefresh re-reads the scenario list.
  */
 @Composable
 fun UsageScenarioCard(
@@ -69,7 +68,6 @@ fun UsageScenarioCard(
     needsShizuku: Boolean,
     loading: Boolean,
     onRequestShizuku: () -> Unit,
-    onRefresh: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var powerInMilliAmps by remember { mutableStateOf(false) }
@@ -99,7 +97,7 @@ fun UsageScenarioCard(
 
         when {
             needsShizuku -> ShizukuRequestState(onRequestShizuku = onRequestShizuku)
-            sortedScenarios.isEmpty() -> EmptyState(loading = loading, onRefresh = onRefresh)
+            sortedScenarios.isEmpty() -> EmptyState(loading = loading)
             else -> sortedScenarios.forEach { scenario ->
                 ScenarioRow(
                     scenario = scenario,
@@ -271,7 +269,6 @@ private fun ShizukuRequestState(
 @Composable
 private fun EmptyState(
     loading: Boolean,
-    onRefresh: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -286,9 +283,5 @@ private fun EmptyState(
             fontSize = 13.sp,
             textAlign = TextAlign.Center,
         )
-        if (!loading) {
-            Spacer(modifier = Modifier.height(6.dp))
-            TextButton(text = "刷新", onClick = onRefresh, colors = ButtonDefaults.textButtonColors())
-        }
     }
 }
