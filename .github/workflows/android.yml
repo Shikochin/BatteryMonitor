@@ -41,16 +41,19 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-        with:
-          packages: "platforms;android-37 build-tools;37.0.0"
 
-      # Belt and braces: if the `packages` input above did not install them, AGP
-      # can still auto-download once the licences are accepted here.
-      - name: Ensure SDK platform is present
+      # The `packages` input of setup-android fails the whole job when a package name does not
+      # exist in the SDK repository. API 37 is published as `platforms;android-37.0` (the SDK now
+      # uses a minor version in the package id), so install it explicitly and keep a fallback.
+      - name: Install SDK platform
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platforms;android-37" "build-tools;37.0.0" > /dev/null \
-            || echo "::warning::sdkmanager install failed; relying on AGP SDK auto-download"
+          set -e
+          install() { sdkmanager --install "$@" > /dev/null 2>&1; }
+          install "platforms;android-37.0" "build-tools;37.0.0" \
+            || install "platforms;android-37.1" "build-tools;37.0.0" \
+            || install "platforms;android-37" "build-tools;37.0.0" \
+            || { echo "::error::Cannot install the Android 37 platform"; sdkmanager --list_installed; exit 1; }
+          echo "Installed platforms:"; ls "$ANDROID_HOME/platforms"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
