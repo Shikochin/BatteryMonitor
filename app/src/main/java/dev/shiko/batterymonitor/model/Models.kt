@@ -92,6 +92,15 @@ data class SessionRecord(
     val endLevelPercent: Int,
 )
 
+/**
+ * Verified state of the detached root sampler.
+ *
+ * Deliberately tri-state: [UNKNOWN] is shown when the app cannot probe the process table (no
+ * Shizuku grant, shell-only service, failed exec). The UI must never turn "I could not check"
+ * into "running".
+ */
+enum class DaemonState { UNKNOWN, RUNNING, STOPPED }
+
 /** Everything the screen needs, produced in one place by [dev.shiko.batterymonitor.data.PowerStatsRepository]. */
 data class PowerUiState(
     val snapshot: BatterySnapshot? = null,
@@ -117,6 +126,8 @@ data class PowerUiState(
     val shizukuAvailable: Boolean = false,
     /** True when the Shizuku shell actually runs as uid 0 (Sui/root), so sysfs is readable. */
     val rootAvailable: Boolean = false,
-    /** True when the detached root sampling daemon is alive (collects while the app is frozen). */
-    val daemonRunning: Boolean = false,
+    /** Last verified state of the detached root sampler (collects while the app is frozen). */
+    val daemonState: DaemonState = DaemonState.UNKNOWN,
+    /** True while a manual "restart sampler" request is in flight. */
+    val daemonRestarting: Boolean = false,
 )

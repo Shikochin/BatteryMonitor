@@ -7,6 +7,8 @@
     <string name="action_history">历史记录</string>
     <string name="action_clear_data">清除数据</string>
     <string name="action_help">说明提示</string>
+    <string name="action_restart_daemon">重启采集</string>
+    <string name="action_restarting">重启中…</string>
     <string name="action_close">关闭</string>
 
     <!-- 下拉刷新 -->
@@ -27,6 +29,7 @@
     <string name="data_source_disconnected">Shizuku (未连接)</string>
     <string name="daemon_running">运行中</string>
     <string name="daemon_stopped">未运行</string>
+    <string name="daemon_unknown">状态未知</string>
     <string name="data_source_line">数据来源：%1$s · 守护进程%2$s</string>
 
     <!-- 卡片标题 -->

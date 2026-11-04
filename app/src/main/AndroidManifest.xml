@@ -3,6 +3,8 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackagesPermission" />
+    <!-- Required by the persisted JobScheduler watchdog that re-arms the sampler after a reboot. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <!--
       miuix-blur declares minSdk 33 because every one of its effects is built on RuntimeShader.
@@ -43,6 +45,12 @@
             android:exported="true"
             android:multiprocess="false"
             android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <!-- Periodic re-arm of the root sampler (see DaemonWatchdog). -->
+        <service
+            android:name=".data.DaemonWatchdogService"
+            android:exported="false"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
 
     </application>
 

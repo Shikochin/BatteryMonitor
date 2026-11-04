@@ -7,6 +7,8 @@
     <string name="action_history">History</string>
     <string name="action_clear_data">Clear data</string>
     <string name="action_help">Help</string>
+    <string name="action_restart_daemon">Restart sampler</string>
+    <string name="action_restarting">Restarting…</string>
     <string name="action_close">Close</string>
 
     <!-- Pull to refresh -->
@@ -27,6 +29,7 @@
     <string name="data_source_disconnected">Shizuku (not connected)</string>
     <string name="daemon_running">running</string>
     <string name="daemon_stopped">stopped</string>
+    <string name="daemon_unknown">unknown</string>
     <string name="data_source_line">Source: %1$s · sampler %2$s</string>
 
     <!-- Card titles -->

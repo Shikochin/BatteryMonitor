@@ -1,13 +1,16 @@
 package dev.shiko.batterymonitor.ui
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
@@ -22,6 +25,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import dev.shiko.batterymonitor.model.DaemonState
 import dev.shiko.batterymonitor.model.PowerUiState
 import dev.shiko.batterymonitor.ui.component.SessionHistoryDialog
 import dev.shiko.batterymonitor.ui.component.StatSummaryCard
@@ -77,6 +81,7 @@ fun PowerStatsScreen(
     onClearData: () -> Unit,
     onRefreshScenarios: () -> Unit,
     onRequestShizuku: () -> Unit,
+    onRestartDaemon: () -> Unit,
     onDeleteHistory: (Long) -> Unit,
     onClearHistory: () -> Unit,
     modifier: Modifier = Modifier,
@@ -203,7 +208,9 @@ fun PowerStatsScreen(
                         shizukuGranted = state.shizukuGranted,
                         rootAvailable = state.rootAvailable,
                         shizukuAvailable = state.shizukuAvailable,
-                        daemonRunning = state.daemonRunning,
+                        daemonState = state.daemonState,
+                        daemonRestarting = state.daemonRestarting,
+                        onRestartDaemon = onRestartDaemon,
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(top = 4.dp),
@@ -262,7 +269,9 @@ private fun DataSourceRow(
     shizukuGranted: Boolean,
     rootAvailable: Boolean,
     shizukuAvailable: Boolean,
-    daemonRunning: Boolean,
+    daemonState: DaemonState,
+    daemonRestarting: Boolean,
+    onRestartDaemon: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val source = stringResource(
@@ -275,20 +284,45 @@ private fun DataSourceRow(
         },
     )
     // The daemon is what keeps collecting while Android freezes this process in the background.
-    val daemonState = stringResource(
-        if (daemonRunning) R.string.daemon_running else R.string.daemon_stopped,
+    // Only a verified probe may say "running"; a failed probe is "unknown", never a stale guess.
+    val daemonStateText = stringResource(
+        when (daemonState) {
+            DaemonState.RUNNING -> R.string.daemon_running
+            DaemonState.STOPPED -> R.string.daemon_stopped
+            DaemonState.UNKNOWN -> R.string.daemon_unknown
+        },
     )
-    val text = stringResource(R.string.data_source_line, source, daemonState)
+    val text = stringResource(R.string.data_source_line, source, daemonStateText)
+    val restartLabel = stringResource(
+        if (daemonRestarting) R.string.action_restarting else R.string.action_restart_daemon,
+    )
 
     Box(
         modifier = modifier,
         contentAlignment = Alignment.Center,
     ) {
-        Text(
-            text = text,
-            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-            fontSize = 12.sp,
-            maxLines = 1,
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = text,
+                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                fontSize = 12.sp,
+                maxLines = 1,
+            )
+            // Without root there is no sampler to restart, so the affordance is not shown at all.
+            if (shizukuGranted && rootAvailable) {
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = restartLabel,
+                    color = MiuixTheme.colorScheme.primary,
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    modifier = Modifier
+                        .clickable(enabled = !daemonRestarting, onClickLabel = restartLabel) {
+                            onRestartDaemon()
+                        }
+                        .padding(horizontal = 2.dp, vertical = 2.dp),
+                )
+            }
+        }
     }
 }

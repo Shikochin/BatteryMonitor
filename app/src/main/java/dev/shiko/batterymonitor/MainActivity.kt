@@ -4,26 +4,28 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.viewModels
 import androidx.compose.runtime.getValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.shiko.batterymonitor.ui.PowerStatsScreen
 import dev.shiko.batterymonitor.ui.theme.BatteryMonitorTheme
 
 class MainActivity : ComponentActivity() {
+
+    private val viewModel: PowerStatsViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         setContent {
             BatteryMonitorTheme {
-                val viewModel: PowerStatsViewModel = viewModel()
                 val state by viewModel.state.collectAsStateWithLifecycle()
                 PowerStatsScreen(
                     state = state,
                     onBack = { finish() },
                     onClearData = { viewModel.clearSessionData() },
                     onRefreshScenarios = { viewModel.refreshScenarios() },
+                    onRestartDaemon = { viewModel.restartDaemon() },
                     onRequestShizuku = { viewModel.requestShizukuPermission() },
                     onDeleteHistory = { startedAtMillis -> viewModel.deleteSessionRecord(startedAtMillis) },
                     onClearHistory = { viewModel.clearSessionHistory() },
@@ -34,9 +36,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        // Permissions may have been granted while we were away (Settings, Shizuku dialog).
-        // The repository re-checks them on its next sampling tick, which updates the StateFlow
-        // this screen collects, so there is nothing to do here.
+        // A sampler that died while the app was frozen must be restarted before the first frame
+        // that shows the footer, and the footer must reflect a fresh probe — not the last cached
+        // "running" from before the app went to the background.
+        viewModel.onAppForeground()
     }
 
 }

@@ -9,6 +9,7 @@ import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import dev.shiko.batterymonitor.model.BatterySnapshot
 import dev.shiko.batterymonitor.model.ChartSample
+import dev.shiko.batterymonitor.model.DaemonState
 import dev.shiko.batterymonitor.model.PowerSummary
 import dev.shiko.batterymonitor.model.PowerUiState
 import dev.shiko.batterymonitor.model.SessionRecord
@@ -24,6 +25,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
 
@@ -136,12 +139,28 @@ class PowerStatsRepository(context: Context) {
 
     // --- root sampling daemon (keeps collecting while the app process is frozen) -----------------
     private val daemon = RootMonitorDaemon(appContext)
-    private var daemonActive: Boolean = false
+    /** Serializes probe/start/stop so two operations can never race the process table. */
+    private val daemonOps = Mutex()
+    /** Last state verified by a probe; never set optimistically. */
+    private var daemonState: DaemonState = DaemonState.UNKNOWN
+    private var daemonRestartInFlight: Boolean = false
     private var daemonOffset: Long = store.loadDaemonOffset()
     private var lastDaemonSampleAt: Long = store.loadDaemonLastSample()
+    private var lastDaemonProbeAt: Long = 0L
     private var lastDaemonStartAttemptAt: Long = 0L
+    /** Last heartbeat value observed, used to detect a live-but-wedged sampler. */
+    private var lastDaemonHeartbeatMillis: Long = 0L
+    /** First time the current heartbeat value was seen; reset whenever it advances. */
+    private var daemonHeartbeatStuckAt: Long = 0L
+    /** Rate limit for heartbeat-driven restarts. */
+    private var lastDaemonRecoveryAt: Long = 0L
     private var daemonIngestJob: Job? = null
+    private var daemonMaintainJob: Job? = null
     private var daemonStartJob: Job? = null
+    private var daemonRestartJob: Job? = null
+
+    /** `true` only while a probe has verified exactly one healthy sampler. */
+    private val daemonActive: Boolean get() = daemonState == DaemonState.RUNNING
 
     /** Screen-on samples that could not be attributed yet; retried after the next `--history` fetch. */
     private val pendingAttribution = ArrayDeque<PendingAttribution>()
@@ -195,6 +214,9 @@ class PowerStatsRepository(context: Context) {
         if (monitoring) {
             requestBatteryReading(force = true)
             restartStatsPipeline(showLoading = false)
+            // Coming back from the background is exactly when a dead daemon used to be missed:
+            // force a real probe instead of trusting the last cached state.
+            maintainDaemon(force = true)
             return
         }
         monitoring = true
@@ -205,7 +227,8 @@ class PowerStatsRepository(context: Context) {
         lastPermissionCheckMillis = System.currentTimeMillis()
         refreshShizukuFlags()
         maybeRequestShizukuPermissionUpFront()
-        startRootDaemon()
+        maintainDaemon(force = true)
+        DaemonWatchdog.schedule(appContext)
 
         requestBatteryReading(screenStateOverride = null, force = true)
         tickJob = scope.launch {
@@ -229,6 +252,30 @@ class PowerStatsRepository(context: Context) {
         unregisterBatteryReceiver()
         persistSession()
     }
+
+    /**
+     * Called when the activity comes back to the foreground. Re-checks Shizuku and forces a real
+     * daemon probe, so a sampler that died while the app was frozen is restarted immediately and
+     * the footer never shows a stale "running".
+     */
+    fun onAppForeground() {
+        refreshShizukuState()
+        // A quick round-trip (permission dialog, recents) keeps the fresh state; after a real
+        // absence the old snapshot is worthless, so show "unknown" until the probe lands rather
+        // than a potentially hours-old "running".
+        if (System.currentTimeMillis() - lastDaemonProbeAt > DAEMON_PROBE_FRESH_MILLIS) {
+            updateDaemonState(DaemonState.UNKNOWN)
+        }
+        maintainDaemon(force = true)
+    }
+
+    /**
+     * Manual "restart sampler" action: kills any running daemon and starts a fresh one.
+     *
+     * Useful after a reboot (the sampler cannot survive it) or when the user suspects the sampler
+     * died — the summary card and the scenario list start moving again as soon as it is back.
+     */
+    fun restartDaemon() = restartDaemonInternal("manual", showUi = true)
 
     /** Re-reads the app list (labels/icons) and the system numbers. */
     fun refreshScenarios() {
@@ -315,6 +362,7 @@ class PowerStatsRepository(context: Context) {
             if (shizukuGranted) {
                 requestBatteryReading(force = true)
                 restartStatsPipeline(showLoading = false)
+                maintainDaemon(force = true)
             } else {
                 clearUnavailableData()
             }
@@ -357,7 +405,7 @@ class PowerStatsRepository(context: Context) {
             if (granted) {
                 requestBatteryReading(force = true)
                 restartStatsPipeline(showLoading = true)
-                startRootDaemon()
+                maintainDaemon(force = true)
             }
             publish()
         }
@@ -378,7 +426,11 @@ class PowerStatsRepository(context: Context) {
         lastSnapshot = null
         latestPowerWatts = null
         lastPowerDump = null
-        daemonActive = false
+        // The root process may still be alive, but without Shizuku there is no way to verify it:
+        // "unknown" is the only honest answer (never a stale "running").
+        daemonState = DaemonState.UNKNOWN
+        lastDaemonHeartbeatMillis = 0L
+        daemonHeartbeatStuckAt = 0L
         lastValidPowerWatts = null
         counterReferenceWatts = null
         lockedCurrentDivisor = null
@@ -405,12 +457,12 @@ class PowerStatsRepository(context: Context) {
         val now = System.currentTimeMillis()
         maybeRefreshShizukuState(now)
         requestBatteryReading()
-        if (daemonActive) {
-            requestDaemonIngest()
-            recoverDaemonIfStalled(now)
-        } else {
-            startRootDaemon()
-        }
+        // Probes the real process table; starts / replaces the sampler when it is not the single
+        // healthy instance. Internally throttled, so this is cheap on every 3 s tick.
+        maintainDaemon()
+        // Ingest on every tick, not only on the 10 s liveness probe: the daemon writes a sample
+        // every 3 s, and the chart / summary must move at the same cadence.
+        if (daemonActive) requestDaemonIngest()
         // Keep the "still open" foreground interval stretching to now: it is rebuilt from the last
         // `--history` dump, so without this the app on screen stops matching ~30 s after the dump
         // and its samples would be dropped.
@@ -434,6 +486,8 @@ class PowerStatsRepository(context: Context) {
         if (shizukuGranted) {
             requestBatteryReading(force = true)
             restartStatsPipeline(showLoading = false)
+            // The daemon dies with the Shizuku server; re-arm it as soon as the binder is back.
+            maintainDaemon(force = true)
         } else {
             clearUnavailableData()
         }
@@ -1021,34 +1075,135 @@ class PowerStatsRepository(context: Context) {
     // Root sampling daemon
     // =============================================================================================
 
-    /** Starts the detached root sampler (idempotent; retried at most once a minute). */
-    private fun startRootDaemon() {
-        if (daemonActive) return
+    /**
+     * Probes the real process table and reconciles the daemon.
+     *
+     * This is the only place that decides whether the sampler is running: every call asks Shizuku
+     * for the actual process list, so a dead daemon can never keep displaying "running" just
+     * because a start was requested earlier. Probes are single-flight and throttled; [force] is
+     * used when the app returns to the foreground or Shizuku comes back.
+     */
+    private fun maintainDaemon(force: Boolean = false) {
+        if (!monitoring) return
+        if (daemonRestartInFlight) return
+        if (daemonMaintainJob?.isActive == true) return
+        val now = System.currentTimeMillis()
+        if (!force && now - lastDaemonProbeAt < DAEMON_PROBE_INTERVAL_MILLIS) return
+        lastDaemonProbeAt = now
+
+        daemonMaintainJob = scope.launch {
+            val status = withContext(Dispatchers.IO) {
+                daemonOps.withLock { runCatching { daemon.status() }.getOrNull() }
+            }
+            if (status == null) {
+                updateDaemonState(DaemonState.UNKNOWN)
+                return@launch
+            }
+            updateDaemonState(status.state)
+            when (status.state) {
+                DaemonState.RUNNING -> {
+                    if (status.outdated) {
+                        // The app was updated while a sampler from the previous build kept running.
+                        // Replace it once so the new script (and its log format) takes effect.
+                        ensureDaemonStarted("script upgrade", force = true)
+                    } else {
+                        trackDaemonHeartbeat(status, now)
+                        requestDaemonIngest()
+                    }
+                }
+
+                DaemonState.STOPPED -> {
+                    daemonHeartbeatStuckAt = 0L
+                    ensureDaemonStarted("probe")
+                }
+
+                DaemonState.UNKNOWN -> Unit
+            }
+        }
+    }
+
+    /** Starts the detached root sampler when it is not the single healthy instance. */
+    private fun ensureDaemonStarted(reason: String, force: Boolean = false) {
         if (!shizukuGranted) return
-        // One attempt at a time: two concurrent spawns would leave two daemons writing the log.
+        if (!rootAvailable) return
+        if (daemonRestartInFlight) return
+        // One attempt at a time: two concurrent spawns would race the process table.
         if (daemonStartJob?.isActive == true) return
         val now = System.currentTimeMillis()
-        if (now - lastDaemonStartAttemptAt < DAEMON_START_RETRY_MILLIS) return
+        if (!force && now - lastDaemonStartAttemptAt < DAEMON_START_RETRY_MILLIS) return
         lastDaemonStartAttemptAt = now
+
         daemonStartJob = scope.launch {
             val started = withContext(Dispatchers.IO) {
-                runCatching { daemon.ensureRunning() }.getOrDefault(false)
+                daemonOps.withLock { runCatching { daemon.ensureRunning() }.getOrDefault(false) }
             }
-            daemonActive = started
-            android.util.Log.d("BatteryDaemon", "daemonActive=$started")
+            lastDaemonProbeAt = System.currentTimeMillis()
+            daemonState = if (started) DaemonState.RUNNING else DaemonState.STOPPED
+            android.util.Log.d("BatteryDaemon", "ensureRunning($reason): running=$started")
             if (started) requestDaemonIngest()
             publish()
         }
     }
 
-    /** Falls back to in-process sampling when the daemon stopped writing samples. */
-    private fun recoverDaemonIfStalled(nowMillis: Long) {
-        val last = lastDaemonSampleAt
-        if (last <= 0L) return
-        if (nowMillis - last <= DAEMON_STALL_MILLIS) return
-        daemonActive = false
-        lastDaemonStartAttemptAt = 0L
-        startRootDaemon()
+    /**
+     * A live process can still be wedged (a stuck `dumpsys` never returns to the loop). The
+     * heartbeat is the difference between "process exists" and "actually sampling".
+     *
+     * Only judged while the screen is on: in deep sleep the whole device is suspended, so a stale
+     * heartbeat there is normal and must not trigger a restart.
+     */
+    private fun trackDaemonHeartbeat(status: DaemonStatus, nowMillis: Long) {
+        val heartbeat = status.heartbeatMillis ?: return
+        if (heartbeat != lastDaemonHeartbeatMillis) {
+            lastDaemonHeartbeatMillis = heartbeat
+            daemonHeartbeatStuckAt = nowMillis
+            return
+        }
+        if (daemonHeartbeatStuckAt == 0L) daemonHeartbeatStuckAt = nowMillis
+        if (lastScreenOn != true) return
+        if (nowMillis - daemonHeartbeatStuckAt < DAEMON_HEARTBEAT_STALL_MILLIS) return
+        if (nowMillis - lastDaemonRecoveryAt < DAEMON_RECOVERY_INTERVAL_MILLIS) return
+
+        lastDaemonRecoveryAt = nowMillis
+        daemonHeartbeatStuckAt = nowMillis
+        android.util.Log.w(
+            "BatteryDaemon",
+            "heartbeat stuck ${(nowMillis - heartbeat) / 1000}s, restarting sampler",
+        )
+        restartDaemonInternal("heartbeat stuck")
+    }
+
+    private fun updateDaemonState(state: DaemonState) {
+        if (daemonState == state) return
+        daemonState = state
+        publish()
+    }
+
+    /** Single restart path for the manual action and the heartbeat watchdog. */
+    private fun restartDaemonInternal(reason: String, showUi: Boolean = false) {
+        if (daemonRestartJob?.isActive == true) return
+        daemonRestartJob = scope.launch {
+            daemonRestartInFlight = true
+            if (showUi) _state.update { it.copy(daemonRestarting = true) }
+
+            val started = withContext(Dispatchers.IO) {
+                daemonOps.withLock { runCatching { daemon.restart() }.getOrDefault(false) }
+            }
+            val now = System.currentTimeMillis()
+            lastDaemonStartAttemptAt = now
+            lastDaemonProbeAt = now
+            daemonState = if (started) DaemonState.RUNNING else DaemonState.STOPPED
+            if (started) {
+                lastDaemonHeartbeatMillis = 0L
+                daemonHeartbeatStuckAt = 0L
+                lastDaemonRecoveryAt = 0L
+                requestDaemonIngest()
+            }
+            daemonRestartInFlight = false
+            if (showUi) _state.update { it.copy(daemonRestarting = false) }
+            android.util.Log.w("BatteryDaemon", "restart($reason): running=$started")
+            publish()
+        }
     }
 
     /** Reads the samples the daemon wrote since the last ingest and folds them into the session. */
@@ -1056,10 +1211,17 @@ class PowerStatsRepository(context: Context) {
         if (!daemonActive) return
         if (daemonIngestJob?.isActive == true) return
         daemonIngestJob = scope.launch {
-            val batch = withContext(Dispatchers.IO) {
-                runCatching { daemon.readNew(daemonOffset) }.getOrNull()
+            val result = withContext(Dispatchers.IO) {
+                val batch = runCatching { daemon.readNew(daemonOffset) }.getOrNull()
+                    ?: return@withContext null
+                // The sample lines no longer repeat the rated capacity; it lives in the state file.
+                val rated = runCatching { daemon.chargeFullMilliAmpHours() }.getOrNull()
+                batch to rated
             } ?: return@launch
+            val (batch, ratedCapacity) = result
             if (batch.samples.isEmpty() && batch.nextOffset == daemonOffset) return@launch
+
+            ratedCapacity?.let { chargeFullMilliAmpHours = it }
 
             daemonOffset = batch.nextOffset
             store.saveDaemonOffset(batch.nextOffset)
@@ -1442,7 +1604,8 @@ class PowerStatsRepository(context: Context) {
                 shizukuGranted = shizukuGranted,
                 shizukuAvailable = shizukuAvailable,
                 rootAvailable = rootAvailable,
-                daemonRunning = daemonActive,
+                daemonState = daemonState,
+                daemonRestarting = daemonRestartInFlight,
             )
         }
     }
@@ -1499,11 +1662,20 @@ class PowerStatsRepository(context: Context) {
         /** How far back a `--history` dump may be parsed to attribute daemon samples. */
         const val MAX_HISTORY_LOOKBACK_MILLIS = 12L * 60L * 60_000L
 
-        /** Retry cadence for starting the root daemon. */
-        const val DAEMON_START_RETRY_MILLIS = 60_000L
+        /** Retry cadence for starting the root daemon after a failed attempt. */
+        const val DAEMON_START_RETRY_MILLIS = 20_000L
 
-        /** No new daemon sample for this long means it died; fall back to in-process sampling. */
-        const val DAEMON_STALL_MILLIS = 90_000L
+        /** How often the real process table is checked while the app is alive. */
+        const val DAEMON_PROBE_INTERVAL_MILLIS = 10_000L
+
+        /** A cached state older than this is not trusted when the app returns to the foreground. */
+        const val DAEMON_PROBE_FRESH_MILLIS = 30_000L
+
+        /** A live process whose heartbeat has not moved for this long is wedged, not sampling. */
+        const val DAEMON_HEARTBEAT_STALL_MILLIS = 120_000L
+
+        /** Minimum gap between heartbeat-driven restarts. */
+        const val DAEMON_RECOVERY_INTERVAL_MILLIS = 120_000L
 
         /** Charge-counter window used to calibrate daemon samples (1 mAh gauge resolution). */
         const val DAEMON_COUNTER_WINDOW_MILLIS = 60_000L

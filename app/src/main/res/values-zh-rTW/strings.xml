@@ -7,6 +7,8 @@
     <string name="action_history">歷史記錄</string>
     <string name="action_clear_data">清除資料</string>
     <string name="action_help">說明提示</string>
+    <string name="action_restart_daemon">重新啟動採集</string>
+    <string name="action_restarting">重新啟動中…</string>
     <string name="action_close">關閉</string>
 
     <!-- 下拉重新整理 -->
@@ -27,6 +29,7 @@
     <string name="data_source_disconnected">Shizuku (未連線)</string>
     <string name="daemon_running">執行中</string>
     <string name="daemon_stopped">未執行</string>
+    <string name="daemon_unknown">狀態未知</string>
     <string name="data_source_line">資料來源：%1$s · 守護程序%2$s</string>
 
     <!-- 卡片標題 -->

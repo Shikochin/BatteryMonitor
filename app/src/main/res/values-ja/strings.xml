@@ -7,6 +7,8 @@
     <string name="action_history">履歴</string>
     <string name="action_clear_data">データを消去</string>
     <string name="action_help">説明</string>
+    <string name="action_restart_daemon">サンプラー再起動</string>
+    <string name="action_restarting">再起動中…</string>
     <string name="action_close">閉じる</string>
 
     <!-- 引いて更新 -->
@@ -27,6 +29,7 @@
     <string name="data_source_disconnected">Shizuku (未接続)</string>
     <string name="daemon_running">実行中</string>
     <string name="daemon_stopped">停止中</string>
+    <string name="daemon_unknown">状態不明</string>
     <string name="data_source_line">データソース：%1$s · サンプラー%2$s</string>
 
     <!-- カードのタイトル -->

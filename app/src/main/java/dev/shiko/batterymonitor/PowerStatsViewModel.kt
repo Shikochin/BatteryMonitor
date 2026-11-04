@@ -23,6 +23,12 @@ class PowerStatsViewModel(application: Application) : AndroidViewModel(applicati
 
     fun refreshScenarios() = repository.refreshScenarios()
 
+    /** The activity is visible again: re-check Shizuku and verify the sampler for real. */
+    fun onAppForeground() = repository.onAppForeground()
+
+    /** Kills any running root sampler and starts a fresh one. */
+    fun restartDaemon() = repository.restartDaemon()
+
     fun clearSessionData() = repository.clearSessionData()
 
     /** Asks the Shizuku service for shell access so we can read `dumpsys batterystats`. */
