@@ -46,7 +46,8 @@ import kotlin.math.roundToInt
  *  - **x axis auto-scales to the session**: the span is picked from Scene's ladder
  *    (10, 15, 30, 45, 60, 90, …, 1440 minutes) so the recorded session fills the chart instead of
  *    being squeezed into / stretched over a fixed 45-minute window. `x = (t - first) / 60 000 *
- *    pixels-per-minute`, exactly like Scene.
+ *    pixels-per-minute`. Screen-off gaps are compressed to one sampling step so the axis matches
+ *    the recorded usage duration shown below the chart.
  *  - **y axis is 0 %…100 %**: a grid line every 10 % and a label every 20 % (`20%` … `100%`), the
  *    bottom of the plot being the 0 % line — Scene loops 0..101 and labels only every other line.
  *  - **app icons are bucketed into 32 px time columns** like Scene: every foreground stretch longer
@@ -90,7 +91,11 @@ fun UsageChart(
     }
 
     val orderedSamples = remember(samples) { samples.sortedBy { it.timestampMillis } }
-    val span = remember(orderedSamples) { axisSpan(orderedSamples) }
+    // The usage summary counts recorded 3 s ticks. A screen-off marker is kept so the curve can
+    // show the grey state, but the wall-clock interval until the next on-screen sample must not
+    // expand the usage axis by the whole time the device was asleep.
+    val chartSamples = remember(orderedSamples) { compressScreenOffGaps(orderedSamples) }
+    val span = remember(chartSamples) { axisSpan(chartSamples) }
     val tickPlan = remember(span) { tickPlan(span.minutes, span.labelCount) }
     val tickLabels = remember(tickPlan, textMeasurer, labelStyle) {
         tickPlan.labelledMinutes.map { textMeasurer.measure(AnnotatedString(formatAxisMinutes(it)), labelStyle) }
@@ -141,7 +146,7 @@ fun UsageChart(
         }
 
         // Scene's x mapping: minutes since the first sample, scaled by the auto-fitted span.
-        val firstTimestampMillis = orderedSamples.firstOrNull()?.timestampMillis ?: 0L
+        val firstTimestampMillis = chartSamples.firstOrNull()?.timestampMillis ?: 0L
         val pixelsPerMinute = plotWidth / span.minutes.toFloat()
         // Distance from the left edge of the plot, without the gutter (`plotLeft`).
         fun xOffsetForTimestamp(timestampMillis: Long): Float =
@@ -203,9 +208,9 @@ fun UsageChart(
         }
 
         clipRect(left = plotLeft, top = plotTop, right = plotRight, bottom = plotBottom) {
-            if (orderedSamples.size < 2) {
+            if (chartSamples.size < 2) {
                 // Nothing recorded yet: a flat line at the last known level keeps the card alive.
-                val level = (orderedSamples.lastOrNull()?.levelPercent ?: startLevelPercent).toFloat()
+                val level = (chartSamples.lastOrNull()?.levelPercent ?: startLevelPercent).toFloat()
                 drawLine(
                     color = screenOnColor,
                     start = Offset(plotLeft, yForLevel(level)),
@@ -214,8 +219,8 @@ fun UsageChart(
                     cap = StrokeCap.Round,
                 )
             } else {
-                val points = ArrayList<Offset>(orderedSamples.size)
-                for (sample in orderedSamples) {
+                val points = ArrayList<Offset>(chartSamples.size)
+                for (sample in chartSamples) {
                     points += Offset(
                         x = xForTimestamp(sample.timestampMillis),
                         y = yForLevel(sample.levelPercent.toFloat()),
@@ -227,11 +232,11 @@ fun UsageChart(
                 // across them instead of restarting at every sample.
                 var index = 0
                 while (index < points.size - 1) {
-                    val style = orderedSamples[index].style
+                    val style = chartSamples[index].style
                     val path = Path().apply {
                         moveTo(points[index].x, points[index].y)
                     }
-                    while (index < points.size - 1 && orderedSamples[index].style == style) {
+                    while (index < points.size - 1 && chartSamples[index].style == style) {
                         index++
                         path.lineTo(points[index].x, points[index].y)
                     }
@@ -256,7 +261,7 @@ fun UsageChart(
 
             if (iconsVisible && icons.isNotEmpty()) {
                 drawAppIcons(
-                    samples = orderedSamples,
+                    samples = chartSamples,
                     icons = icons,
                     baselineY = yForLevel(0f),
                     plotTop = plotTop,
@@ -421,6 +426,43 @@ private val SpanLabelCounts =
 
 /** Span used while nothing is recorded yet (Scene falls back to 30 minutes). */
 private const val EmptySpanMinutes = 30
+
+/**
+ * Keeps screen-off markers visible without letting sleep time consume the usage chart's x axis.
+ * The first sample after the screen turns off and the first one after it turns back on are still
+ * connected, but that transition is represented by one normal sampling step (3 s) rather than
+ * the entire wall-clock gap between the two points.
+ */
+internal fun compressScreenOffGaps(samples: List<ChartSample>): List<ChartSample> {
+    if (samples.size < 2) return samples
+
+    val compressed = ArrayList<ChartSample>(samples.size)
+    var timestamp = samples.first().timestampMillis
+    compressed += samples.first().copy(timestampMillis = timestamp)
+
+    for (index in 1 until samples.size) {
+        val previous = samples[index - 1]
+        val current = samples[index]
+        val elapsed = (current.timestampMillis - previous.timestampMillis).coerceAtLeast(0L)
+        val screenOffTransition = previous.style.isScreenOff() || current.style.isScreenOff()
+        val displayedElapsed = if (screenOffTransition) {
+            elapsed.coerceAtMost(ChartTickMillis)
+        } else {
+            elapsed
+        }
+        timestamp += displayedElapsed
+        compressed += current.copy(timestampMillis = timestamp)
+    }
+    return compressed
+}
+
+private fun ChartSegmentStyle.isScreenOff(): Boolean = when (this) {
+    ChartSegmentStyle.ScreenOff, ChartSegmentStyle.MissedRecordScreenOff -> true
+
+    ChartSegmentStyle.ScreenOn, ChartSegmentStyle.MissedRecordScreenOn -> false
+}
+
+private const val ChartTickMillis = 3_000L
 
 /** Picks the axis span for the recorded session, mirroring Scene's `d(double)`. */
 private fun axisSpan(samples: List<ChartSample>): AxisSpan {
