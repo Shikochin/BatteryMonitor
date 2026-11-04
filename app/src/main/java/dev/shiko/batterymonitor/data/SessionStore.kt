@@ -6,17 +6,24 @@ import dev.shiko.batterymonitor.model.ChartSegmentStyle
 import dev.shiko.batterymonitor.model.SessionRecord
 import kotlin.math.roundToInt
 
+/** Persisted state of the running session (Scene keeps the equivalent in its SQLite `records`). */
+internal data class StoredSession(
+    val startMillis: Long,
+    val startLevelPercent: Int?,
+    val sampleCount: Int,
+    /** Σ(current_mA × voltage_V) in mW. */
+    val powerMilliWattSum: Double,
+    val lastSampleAtMillis: Long,
+    val lastSampleLevel: Int,
+    val packages: Map<String, PackageAggregate>,
+)
+
 /**
- * Compact [SharedPreferences] persistence for the monitoring session.
+ * Compact `SharedPreferences` persistence: chart samples, the running session (aggregates included)
+ * and the finished-session history.
  *
- * No new dependency is allowed (no Room / kotlinx-serialization), so every list is encoded as one
- * flat string:
- *
- *  - samples  → `ts,level,mV,dC,mA,mW,style,flags,energyWh;…`
- *  - history  → `startedAt,duration,avgP_mW,energy_mWh,startLevel,endLevel;…`
- *
- * The whole chart window (≈180 points at the 15 s cadence) is a few kilobytes, far below the
- * `SharedPreferences` comfort zone.
+ * No new dependency is allowed (no Room / kotlinx-serialization), so every structure is a flat
+ * string: `…;…` for lists and `,` for fields.
  */
 internal class SessionStore(context: Context) {
 
@@ -31,7 +38,7 @@ internal class SessionStore(context: Context) {
     }
 
     // ---------------------------------------------------------------------------------------------
-    // Samples
+    // Chart samples
     // ---------------------------------------------------------------------------------------------
 
     fun loadSamples(): List<PowerSample> {
@@ -45,51 +52,55 @@ internal class SessionStore(context: Context) {
             prefs.edit().remove(KEY_SAMPLES).apply()
             return
         }
-        val encoded = samples.joinToString(ENTRY_SEPARATOR) { encodeSample(it) }
-        prefs.edit().putString(KEY_SAMPLES, encoded).apply()
+        prefs.edit().putString(KEY_SAMPLES, samples.joinToString(ENTRY_SEPARATOR, transform = ::encodeSample)).apply()
     }
 
     // ---------------------------------------------------------------------------------------------
-    // Session metadata
+    // Running session
     // ---------------------------------------------------------------------------------------------
 
-    fun loadSessionStartMillis(): Long? =
-        prefs.getLong(KEY_SESSION_START, NO_VALUE).takeIf { it > 0L }
-
-    fun saveSessionStartMillis(millis: Long?) {
-        val editor = prefs.edit()
-        if (millis == null || millis <= 0L) {
-            editor.remove(KEY_SESSION_START)
-        } else {
-            editor.putLong(KEY_SESSION_START, millis)
-        }
-        editor.apply()
+    fun loadSession(): StoredSession? {
+        val start = prefs.getLong(KEY_SESSION_START, NO_VALUE)
+        if (start <= 0L) return null
+        return StoredSession(
+            startMillis = start,
+            startLevelPercent = prefs.getInt(KEY_START_LEVEL, NO_VALUE.toInt()).takeIf { it in 0..100 },
+            sampleCount = prefs.getInt(KEY_SAMPLE_COUNT, 0),
+            powerMilliWattSum = prefs.getLong(KEY_POWER_SUM, 0L).toDouble(),
+            lastSampleAtMillis = prefs.getLong(KEY_LAST_SAMPLE_AT, 0L),
+            lastSampleLevel = prefs.getInt(KEY_LAST_SAMPLE_LEVEL, -1),
+            packages = AggregateCodec.decode(prefs.getString(KEY_PACKAGES, null)),
+        )
     }
 
-    fun loadStartLevelPercent(): Int? =
-        prefs.getInt(KEY_START_LEVEL, NO_VALUE.toInt()).takeIf { it in 0..100 }
-
-    fun saveStartLevelPercent(levelPercent: Int?) {
+    fun saveSession(session: StoredSession?) {
         val editor = prefs.edit()
-        if (levelPercent == null || levelPercent !in 0..100) {
-            editor.remove(KEY_START_LEVEL)
-        } else {
-            editor.putInt(KEY_START_LEVEL, levelPercent)
+        if (session == null || session.startMillis <= 0L) {
+            editor
+                .remove(KEY_SESSION_START)
+                .remove(KEY_START_LEVEL)
+                .remove(KEY_SAMPLE_COUNT)
+                .remove(KEY_POWER_SUM)
+                .remove(KEY_LAST_SAMPLE_AT)
+                .remove(KEY_LAST_SAMPLE_LEVEL)
+                .remove(KEY_PACKAGES)
+                .apply()
+            return
         }
-        editor.apply()
-    }
-
-    /** Session-wide time-weighted power accumulators (`Σ W·ms`, `Σ ms`) as `Long`s. */
-    fun loadAccumulators(): Pair<Double, Double> = Pair(
-        prefs.getLong(KEY_WEIGHTED_POWER, 0L).toDouble(),
-        prefs.getLong(KEY_WEIGHT, 0L).toDouble(),
-    )
-
-    fun saveAccumulators(weightedPowerSum: Double, weightSum: Double) {
-        prefs.edit()
-            .putLong(KEY_WEIGHTED_POWER, weightedPowerSum.coerceAtLeast(0.0).toLong())
-            .putLong(KEY_WEIGHT, weightSum.coerceAtLeast(0.0).toLong())
+        editor
+            .putLong(KEY_SESSION_START, session.startMillis)
+            .putInt(KEY_SAMPLE_COUNT, session.sampleCount)
+            .putLong(KEY_POWER_SUM, session.powerMilliWattSum.toLong())
+            .putLong(KEY_LAST_SAMPLE_AT, session.lastSampleAtMillis)
+            .putInt(KEY_LAST_SAMPLE_LEVEL, session.lastSampleLevel)
             .apply()
+        session.startLevelPercent?.let { editor.putInt(KEY_START_LEVEL, it) }
+        if (session.packages.isEmpty()) {
+            editor.remove(KEY_PACKAGES)
+        } else {
+            editor.putString(KEY_PACKAGES, AggregateCodec.encode(session.packages))
+        }
+        editor.apply()
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -107,18 +118,20 @@ internal class SessionStore(context: Context) {
             prefs.edit().remove(KEY_HISTORY).apply()
             return
         }
-        val encoded = records.joinToString(ENTRY_SEPARATOR) { encodeRecord(it) }
-        prefs.edit().putString(KEY_HISTORY, encoded).apply()
+        prefs.edit().putString(KEY_HISTORY, records.joinToString(ENTRY_SEPARATOR, transform = ::encodeRecord)).apply()
     }
 
-    /** Wipes samples, session start/level and the accumulators; the history is kept. */
+    /** Wipes the running session and the chart samples; the history list is kept. */
     fun clearSession() {
         prefs.edit()
             .remove(KEY_SAMPLES)
             .remove(KEY_SESSION_START)
             .remove(KEY_START_LEVEL)
-            .remove(KEY_WEIGHTED_POWER)
-            .remove(KEY_WEIGHT)
+            .remove(KEY_SAMPLE_COUNT)
+            .remove(KEY_POWER_SUM)
+            .remove(KEY_LAST_SAMPLE_AT)
+            .remove(KEY_LAST_SAMPLE_LEVEL)
+            .remove(KEY_PACKAGES)
             .apply()
     }
 
@@ -137,11 +150,14 @@ internal class SessionStore(context: Context) {
         append(FIELD_SEPARATOR)
         append(sample.currentMilliAmps.roundToInt())
         append(FIELD_SEPARATOR)
-        append((sample.powerWatts * 1000f).roundToInt())
+        append(sample.powerMilliWatts.roundToInt())
         append(FIELD_SEPARATOR)
         append(sample.style.ordinal)
         append(FIELD_SEPARATOR)
-        append(sampleFlags(sample))
+        var flags = 0
+        if (sample.screenOn) flags = flags or FLAG_SCREEN_ON
+        if (sample.charging) flags = flags or FLAG_CHARGING
+        append(flags)
         append(FIELD_SEPARATOR)
         append(sample.remainingEnergyWattHours?.let { (it * 10f).roundToInt() } ?: -1)
     }
@@ -157,20 +173,13 @@ internal class SessionStore(context: Context) {
                 voltageVolts = parts[2].toInt() / 1000f,
                 temperatureCelsius = parts[3].toInt() / 10f,
                 currentMilliAmps = parts[4].toInt().toFloat(),
-                powerWatts = parts[5].toInt() / 1000f,
+                powerMilliWatts = parts[5].toInt().toFloat(),
                 style = STYLE_VALUES.getOrElse(parts[6].toInt()) { ChartSegmentStyle.ScreenOn },
                 screenOn = flags and FLAG_SCREEN_ON != 0,
                 charging = flags and FLAG_CHARGING != 0,
                 remainingEnergyWattHours = parts[8].toInt().takeIf { it >= 0 }?.let { it / 10f },
             )
         }.getOrNull()
-    }
-
-    private fun sampleFlags(sample: PowerSample): Int {
-        var flags = 0
-        if (sample.screenOn) flags = flags or FLAG_SCREEN_ON
-        if (sample.charging) flags = flags or FLAG_CHARGING
-        return flags
     }
 
     private fun encodeRecord(record: SessionRecord): String = buildString {
@@ -204,14 +213,17 @@ internal class SessionStore(context: Context) {
 
     private companion object {
         const val PREFS_NAME = "power_stats_session"
-        const val STORE_VERSION = 2
+        const val STORE_VERSION = 3
 
         const val KEY_VERSION = "version"
         const val KEY_SAMPLES = "samples"
         const val KEY_SESSION_START = "session_start"
         const val KEY_START_LEVEL = "start_level"
-        const val KEY_WEIGHTED_POWER = "weighted_power"
-        const val KEY_WEIGHT = "weight"
+        const val KEY_SAMPLE_COUNT = "sample_count"
+        const val KEY_POWER_SUM = "power_sum"
+        const val KEY_LAST_SAMPLE_AT = "last_sample_at"
+        const val KEY_LAST_SAMPLE_LEVEL = "last_sample_level"
+        const val KEY_PACKAGES = "packages"
         const val KEY_HISTORY = "history"
 
         const val ENTRY_SEPARATOR = ";"
@@ -220,7 +232,6 @@ internal class SessionStore(context: Context) {
         const val RECORD_FIELD_COUNT = 6
         const val NO_VALUE = -1L
 
-        /** Bit flags packed into the sample's `flags` column. */
         const val FLAG_SCREEN_ON = 1
         const val FLAG_CHARGING = 2
 

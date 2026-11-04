@@ -123,13 +123,13 @@ fun PowerStatsScreen(
                 // instead of an (empty) list.
                 needsShizuku = !state.shizukuGranted,
                 loading = state.loadingScenarios,
-                voltageVolts = state.snapshot?.voltageVolts ?: 0f,
                 onRequestShizuku = onRequestShizuku,
                 onRefresh = onRefreshScenarios,
                 modifier = Modifier.fillMaxWidth(),
             )
             DataSourceRow(
                 shizukuGranted = state.shizukuGranted,
+                rootAvailable = state.rootAvailable,
                 shizukuAvailable = state.shizukuAvailable,
                 onRequestShizuku = onRequestShizuku,
                 modifier = Modifier
@@ -186,6 +186,7 @@ fun PowerStatsScreen(
 @Composable
 private fun DataSourceRow(
     shizukuGranted: Boolean,
+    rootAvailable: Boolean,
     shizukuAvailable: Boolean,
     onRequestShizuku: () -> Unit,
     modifier: Modifier = Modifier,
@@ -197,7 +198,11 @@ private fun DataSourceRow(
             contentAlignment = Alignment.Center,
         ) {
             Text(
-                text = "数据来源：Shizuku · 系统电池统计",
+                text = if (rootAvailable) {
+                    "数据来源：Shizuku (root) · 系统电池统计"
+                } else {
+                    "数据来源：Shizuku (shell) · 系统电池统计"
+                },
                 color = color,
                 fontSize = 12.sp,
                 maxLines = 1,

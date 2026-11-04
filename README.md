@@ -20,25 +20,38 @@
 | 历史记录 | 每次清除统计会存档一条：`-x%/h / xW / xWh / xh`，可单条删除或清空 |
 | 说明提示 | 图表虚线含义的说明弹窗（对齐参考图） |
 
-## 数据来源
+## 数据来源与算法（对齐 Scene 9.4.18）
 
-**只走 Shizuku / Sui**：启动即请求权限，拿到 shell 身份后直接读系统的账本，不再用 `UsageStatsManager` 估算。
+**只走 Shizuku / Sui**：启动即请求权限。Sui 以 root 运行时（`Shizuku.getUid() == 0`）优先读
+`/sys/class/power_supply/`（`current_now` / `voltage_now` / `capacity` / `temp` / `charge_full`，
+即 Scene 用的 sysfs 来源）；只有 shell 身份时退回 `dumpsys battery`；逐应用统计始终用
+`dumpsys batterystats`。
 
-| 数据 | 来源 |
+| 项目 | 口径（与 Scene 一致） |
 | --- | --- |
-| 电量 / 电压 / 温度 / 充电计数器 | `dumpsys battery`（每 3 s） |
-| 平均功耗、已使用 | `dumpsys batterystats --charged`：`Discharge(mAh) × V ÷ Time on battery` |
-| 每应用功耗 | 每个 UID 的 mAh × V ÷ 前台时长；时长取自 `--history` 的 `+fg/-fg` 事件 |
-| 使用过程曲线 | 启动时用 `batterystats --charged --history` 回填最近 45 分钟，之后按 3 s 采样追加 |
-| 满容量 Wh | 系统学到的电池容量 × 3.87 V 标称电压（含健康度衰减） |
+| 采样 | **只在「放电 + 亮屏」时**每 3 s 记一条；充电/满电不记；熄屏补一个标记点后停止 |
+| 平均功耗 | `avg(current × voltage)`（mW→W），只统计本会话亮屏放电样本 |
+| 已使用 | `样本数 × 3 s` |
+| 理论续航 | `剩余 Wh ÷ 平均功耗 × 0.9`（**按要求用剩余能量**，保留 Scene 的 0.9 折损） |
+| 满容量 Wh | `charge_full(mAh) × 3.86 V`（≤2510 mAh 时 ×2 处理双电芯）——本机 7500 × 3.86 = **28.9 Wh** |
+| 使用场景 | 同一批样本按包分组：`avg(current×voltage)`、`avg/min/max(温度)`、时长 `样本数×3 s`；不经整机平均兜底，没有样本的包不出现 |
+| 曲线 | 相邻样本间隔 **> 10 s** 判为未记录（虚线）；`包名/充电/电量/亮屏`任一变化即切段 |
+| 会话重置 | 间隔 > 24 h、间隔 > 30 s 且电量上升、`|I| > 60 A` |
 
-界面底部显示当前状态：已授权 → `数据来源：Shizuku · 系统电池统计`；服务在但没授权 → 可点「需要 Shizuku 权限，点击授权」；没检测到服务 → `未检测到 Shizuku / Sui 服务`。
+> **电流单位自校准**：这台 OPPO 的 `current_now`（0.1 mA 量级）与 `dumpsys` 的 `Battery current`
+> （mA 量级）都不是标准 µA，所以每次读数都按 µA/mA/0.1 mA 三种解释算功率，再与充电计数器的
+> ΔWh/Δt（≥5 s 窗口）比对，取比值 0.33–3 内最接近的那个；超界读数直接丢弃，不夹逼、不入库。
 
-> 本机实测（OnePlus PLZ110 / Android 17 / 7500 mAh）：ColorOS 不提供 `current now`，公共 API 只能给出估算；经 Sui 授权后平均功耗 1.0–2.1 W、每应用功耗与 Scene 同口径（哔哩哔哩 2.7 W 对 2.69 W）。
+界面底部显示 `数据来源：Shizuku (root) · 系统电池统计` 或 `Shizuku (shell)`。
+
+> 本机实测（OnePlus PLZ110 / Android 17 / 7500 mAh）：root 模式下瞬时功率 −0.74 W、
+> 平均功耗 1.36 W、理论续航 16h52m、哔哩哔哩逐应用 2.55 W —— 与 Scene 同量级（其对照片 2.03 W / 2.69 W）。
 
 ## 权限
 
 - **Shizuku / Sui**：必需。安装并激活 Shizuku（或使用 Sui 这类 root 模块）后，应用启动会自动弹出授权请求。
+- **root（可选）**：在 Sui 里给本应用 root 权限后，瞬时功率/电压走 sysfs，跟上屏幕负载变化；
+  只有 shell 权限时用充电计数器估算（≥5 s 窗口，粒度 1 mAh），数值更保守。
 
 ## 构建
 

@@ -45,7 +45,6 @@ import top.yukonga.miuix.kmp.icon.extended.Sort
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /** Voltage used to turn watts into milliamps when no battery snapshot is available yet. */
-private const val FALLBACK_VOLTS = 4.0f
 
 /**
  * Card 3 — "使用场景": one row per app with icon, label, AVG/MAX telemetry and duration.
@@ -61,7 +60,6 @@ private const val FALLBACK_VOLTS = 4.0f
  * @param scenarios the app breakdown, in whatever order the repository produced it.
  * @param needsShizuku whether the Shizuku permission still has to be granted.
  * @param loading whether the breakdown is currently being computed.
- * @param voltageVolts live battery voltage, used for the W → mA conversion; 0 when unknown.
  * @param onRequestShizuku asks Shizuku for the permission ("去授权").
  * @param onRefresh re-reads the scenario list.
  */
@@ -70,14 +68,12 @@ fun UsageScenarioCard(
     scenarios: List<UsageScenario>,
     needsShizuku: Boolean,
     loading: Boolean,
-    voltageVolts: Float,
     onRequestShizuku: () -> Unit,
     onRefresh: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var powerInMilliAmps by remember { mutableStateOf(false) }
     var sortDescending by remember { mutableStateOf(true) }
-    val volts = if (voltageVolts > 0f) voltageVolts else FALLBACK_VOLTS
 
     // Always ordered by draw (Scene's default is highest power first); the sort action flips it.
     val sortedScenarios = remember(scenarios, sortDescending) {
@@ -108,7 +104,6 @@ fun UsageScenarioCard(
                 ScenarioRow(
                     scenario = scenario,
                     powerInMilliAmps = powerInMilliAmps,
-                    volts = volts,
                 )
             }
         }
@@ -165,7 +160,6 @@ private fun ScenarioHeader(
 private fun ScenarioRow(
     scenario: UsageScenario,
     powerInMilliAmps: Boolean,
-    volts: Float,
     modifier: Modifier = Modifier,
 ) {
     Row(
@@ -186,7 +180,7 @@ private fun ScenarioRow(
             )
             Spacer(modifier = Modifier.height(3.dp))
             Text(
-                text = "AVG: ${formatAverage(scenario.averagePowerWatts, powerInMilliAmps, volts)}, " +
+                text = "AVG: ${formatAverage(scenario.averagePowerWatts, scenario.averageCurrentMilliAmps, powerInMilliAmps)}, " +
                     "${formatCelsius(scenario.averageTemperatureCelsius, 0)}   " +
                     "MAX: ${formatCelsius(scenario.maxTemperatureCelsius, 0)}",
                 color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
@@ -209,12 +203,16 @@ private fun ScenarioRow(
  * Formats an average draw either as watts or, when the mA switch is on, as milliamps using the
  * live battery voltage (Scene shows whole milliamps).
  */
-private fun formatAverage(averagePowerWatts: Float, powerInMilliAmps: Boolean, volts: Float): String =
-    if (powerInMilliAmps) {
-        formatMilliAmps(averagePowerWatts / volts * 1000f)
-    } else {
-        formatWatts(averagePowerWatts)
-    }
+private fun formatAverage(
+    averagePowerWatts: Float,
+    averageCurrentMilliAmps: Float,
+    powerInMilliAmps: Boolean,
+): String = if (powerInMilliAmps) {
+    // Scene shows the measured average current in mA mode, not a W/V conversion.
+    formatMilliAmps(averageCurrentMilliAmps)
+} else {
+    formatWatts(averagePowerWatts)
+}
 
 /** Rounded app icon, with a neutral placeholder when the launcher icon could not be loaded. */
 @Composable

@@ -40,6 +40,19 @@ internal object ShizukuBridge {
         false
     }
 
+    /**
+     * The uid the Shizuku service runs as: `0` means it can read `/sys/class/power_supply` directly
+     * (Sui via KernelSU/Magisk), `2000` means shell-only. `null` when the service is not running.
+     */
+    fun serverUid(): Int? {
+        if (!isServiceAvailable()) return null
+        return try {
+            Shizuku.getUid()
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
     /** `true` when the service is alive and this app has been granted Shizuku access. */
     fun hasPermission(): Boolean {
         if (!isServiceAvailable()) return false

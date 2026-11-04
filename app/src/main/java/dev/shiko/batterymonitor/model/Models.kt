@@ -68,8 +68,10 @@ data class UsageScenario(
     val icon: ImageBitmap?,
     /** Total time the app was in the foreground within the window. */
     val durationMillis: Long,
-    /** Average power draw attributed to the app, in watts. */
+    /** Average power draw while the app was in the foreground, in watts. */
     val averagePowerWatts: Float,
+    /** Average current while the app was in the foreground, in milliamps (Scene's mA mode). */
+    val averageCurrentMilliAmps: Float = 0f,
     /** Average battery temperature while the app was in the foreground. */
     val averageTemperatureCelsius: Float,
     /** Hottest battery temperature observed while the app was in the foreground. */
@@ -109,4 +111,6 @@ data class PowerUiState(
     val shizukuGranted: Boolean = false,
     /** True when Shizuku is installed & running but permission has not been granted yet. */
     val shizukuAvailable: Boolean = false,
+    /** True when the Shizuku shell actually runs as uid 0 (Sui/root), so sysfs is readable. */
+    val rootAvailable: Boolean = false,
 )

@@ -584,3 +584,17 @@ internal object SystemBatteryStatsSource {
     /** Allow a few seconds of clock skew when deciding "this stamp is in the future". */
     private const val HISTORY_FUTURE_SLACK_MILLIS = 2L * 24L * 60L * 60L * 1000L
 }
+
+/**
+ * Maps a `dumpsys battery` dump onto the raw reading: the OPLUS `Battery current` value is kept
+ * as-is because its unit is not reliable; [CurrentCalibrator] resolves it against the fuel gauge.
+ */
+internal fun SystemBatteryStatsSource.BatteryDump.toRawReading(): RawBatteryReading = RawBatteryReading(
+    levelPercent = levelPercent ?: 0,
+    voltageVolts = voltageVolts ?: 0f,
+    rawCurrent = currentMilliAmps?.toLong(),
+    temperatureCelsius = temperatureCelsius ?: 0f,
+    status = status ?: 0,
+    chargeCounterMicroAmpHours = chargeCounterMicroAmpHours,
+    chargeFullMilliAmpHours = null,
+)

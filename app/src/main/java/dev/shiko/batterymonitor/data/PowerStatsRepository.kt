@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.os.BatteryManager
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import dev.shiko.batterymonitor.model.BatterySnapshot
@@ -29,26 +30,20 @@ import kotlin.math.abs
 /**
  * The single source of truth for the "耗电统计" screen.
  *
- * The whole screen is **live at 1 Hz**: one coroutine heartbeat emits a new [PowerUiState] every
- * second, so `已使用`, `平均功耗`, `理论续航`, the battery telemetry and the chart's right edge all
- * advance continuously. The expensive inputs run in their own, never overlapping, pipelines:
+ * The maths are aligned with Scene 9.4.18 (`Analyser-Power` + its SQL queries):
  *
- *  ```
- *  tick (3 s, main) ──► chart point (de-duplicated) ──► state
- *      │
- *      ├─ requestBatterySnapshot()  single-flight: `dumpsys battery` (level/voltage/temp/counter)
- *      └─ stats pipeline            serial loop: `dumpsys batterystats --charged`
- *                                   (per-UID mAh, discharge/time) and, hourly, `--history`
- *  ```
+ *  - a sample is recorded **only while discharging and the screen is on** (plus one final
+ *    `screenOn = false` record when the screen turns off, which is what draws the grey chart
+ *    segment); charging periods record nothing,
+ *  - `平均功耗` = mean of `current(mA) × voltage(V)` over the session's screen-on samples,
+ *  - `已使用` = `sampleCount × 3 s`,
+ *  - `理论续航` = `remainingWh / avgPower × 0.9`,
+ *  - `使用场景` = the same samples grouped per foreground package (no UID/whole-device fallback),
+ *  - the chart breaks into dotted segments when the gap between samples exceeds 10 s.
  *
- * The app is **Shizuku-only**: every number comes from the system's own accounting through the
- * shell service. Without the Shizuku permission there is no data — `snapshot` stays `null`, the
- * summary stays zeroed and the UI shows its "grant permission" state.
- *
- * Threading: the repository scope is `Dispatchers.Main.immediate`; all session state is mutated
- * there, so there is no lock. Every blocking framework call (exec, PackageManager) is pushed to
- * `Dispatchers.IO`. A slow `dumpsys` never blocks the tick — the state simply re-emits with the
- * previous numbers.
+ * Data comes from Shizuku: sysfs when the service runs as root (Sui/KernelSU), `dumpsys battery`
+ * otherwise, and `dumpsys batterystats` for the foreground intervals, the learned capacity and the
+ * chart history seed. Without the permission there is no data at all (snapshot `null`, summary 0).
  */
 class PowerStatsRepository(context: Context) {
 
@@ -72,75 +67,70 @@ class PowerStatsRepository(context: Context) {
 
     val state: StateFlow<PowerUiState> = _state.asStateFlow()
 
-    // --- session (may be longer than the chart window) -------------------------------------------
+    // --- running session (Scene's records table) ---------------------------------------------------
     private var sessionStartMillis: Long? = null
     private var startLevelPercent: Int? = null
 
-    /** `Σ power(W) × Δt(ms)` and `Σ Δt(ms)`, folded in on every 1 s tick. */
-    private var weightedPowerSum: Double = 0.0
-    private var weightSum: Double = 0.0
-    private var lastAccumulatorAtMillis: Long = 0L
+    /** Number of screen-on discharging samples in the session. */
+    private var sessionSampleCount: Int = 0
 
-    // --- live sampling ---------------------------------------------------------------------------
+    /** Σ(current_mA × voltage_V) in mW over those samples (negative while discharging). */
+    private var sessionPowerMilliWattSum: Double = 0.0
+    private val packageAggregates = LinkedHashMap<String, PackageAggregate>()
+
+    private var lastSampleAtMillis: Long = 0L
+    private var lastSampleLevel: Int = -1
+    private var lastSampleWasScreenOn: Boolean = false
+
+    // --- live reading ------------------------------------------------------------------------------
+    private var lastReading: BatteryReading? = null
+    private var lastRawReading: RawBatteryReading? = null
+    private var lastReadingAtMillis: Long = 0L
+    private var lastScreenOn: Boolean? = null
     private var lastSnapshot: BatterySnapshot? = null
-    private val windowSamples = mutableListOf<PowerSample>()
-    private var chartSamples: List<ChartSample> = emptyList()
-
-    /** Chart points reconstructed from `dumpsys batterystats --history` (Shizuku only). */
-    private var historyChartSamples: List<ChartSample> = emptyList()
-    private var historySeedAllowed: Boolean = true
-
-    /** Timestamp of the previous tick; drives the `MissedRecord*` gap detection. */
-    private var lastTickAtMillis: Long = 0L
-    private var lastValidPowerWatts: Float? = null
     private var latestPowerWatts: Float? = null
-    private val recentPowers = ArrayDeque<Float>()
-    private var lastSamplesPersistedAtMillis: Long = 0L
 
-    /** Fuel-gauge anchor for the energy-delta estimate (charge counter, 1 mAh resolution). */
-    private var energyAnchorWattHours: Float? = null
-    private var energyAnchorMillis: Long = 0L
-
-    /** Anchor for the Shizuku charge-counter delta (the counter moves once every few seconds). */
+    // --- charge counter → reference power for the current calibration -------------------------------
     private var counterAnchorMicroAmpHours: Long? = null
     private var counterAnchorMillis: Long = 0L
+    private var counterReferenceWatts: Float? = null
+    private var counterReferenceAtMillis: Long = 0L
+    private var lastValidPowerWatts: Float? = null
 
-    // --- Shizuku (system accounting) ---------------------------------------------------------------
+    // --- chart ------------------------------------------------------------------------------------
+    private val windowSamples = mutableListOf<PowerSample>()
+    private var chartSamples: List<ChartSample> = emptyList()
+    private var historyChartSamples: List<ChartSample> = emptyList()
+    private var historySeedAllowed: Boolean = true
+    private var lastChartPointAtMillis: Long = 0L
+    private var lastSamplesPersistedAtMillis: Long = 0L
+
+    // --- capacity ---------------------------------------------------------------------------------
+    private var learnedCapacityMilliAmpHours: Int? = null
+    private var designCapacityMilliAmpHours: Int? = null
+    private var chargeFullMilliAmpHours: Float? = null
+    private var fullCapacityWattHoursCache: Float? = null
+
+    // --- Shizuku / root ---------------------------------------------------------------------------
     private var shizukuAvailable: Boolean = false
     private var shizukuGranted: Boolean = false
-
-    /** The permission dialog is shown at most once per process, not in a loop. */
+    private var rootAvailable: Boolean = false
     private var shizukuPermissionRequested: Boolean = false
-    private var lastBatteryDump: SystemBatteryStatsSource.BatteryDump? = null
-    private var lastBatteryDumpMillis: Long = 0L
+    private var lastPermissionCheckMillis: Long = 0L
+
+    // --- foreground intervals (from the batterystats history) -------------------------------------
+    private var foregroundIntervals: Map<String, List<TimeInterval>> = emptyMap()
+    private var intervalIndex: List<IntervalEntry> = emptyList()
+    private var intervalsFetchedAtMillis: Long = 0L
+    private var lastHistoryFetchMillis: Long = 0L
     private var lastPowerDump: SystemBatteryStatsSource.PowerDump? = null
 
-    /** Per-package foreground intervals reconstructed from the batterystats history stream. */
-    private var foregroundIntervals: Map<String, List<TimeInterval>> = emptyMap()
-    private var foregroundIntervalsFetchedAtMillis: Long = 0L
-    private var lastHistoryFetchMillis: Long = 0L
+    /** Set when a sample could not be attributed to a package; triggers an early history refresh. */
+    private var unattributedSampleSeen: Boolean = false
 
-    /** `Time on battery` from the last stats fetch plus the drift since that fetch. */
-    private var systemTimeOnBatteryMillis: Long = 0L
-    private var systemStatsFetchedAtMillis: Long = 0L
-    private var smoothedSystemAverageWatts: Float? = null
-    private var designCapacityMilliAmpHours: Int? = null
-    /** Health-adjusted capacity the system learned for this pack (`Last learned battery capacity`). */
-    private var learnedCapacityMilliAmpHours: Int? = null
-
-    /**
-     * Full-pack watt-hours, computed **once** from the first successful system dump. It is a
-     * hardware property (design capacity after health degradation), not a live value, so it must
-     * not flicker with every refresh.
-     */
-    private var fullCapacityWattHoursCache: Float? = null
-    private var shizukuPowerWatts: Float? = null
-
-    // --- usage-scenario cache ---------------------------------------------------------------------
+    // --- per-app presentation ---------------------------------------------------------------------
     private var scenarios: List<UsageScenario> = emptyList()
-    private var scenarioCandidates: List<ScenarioCandidate> = emptyList()
     private var visualCache: Map<String, PackageVisuals.AppVisual> = emptyMap()
-    private var lastPermissionCheckMillis: Long = 0L
 
     // --- lifecycle --------------------------------------------------------------------------------
     private var monitoring: Boolean = false
@@ -152,9 +142,9 @@ class PowerStatsRepository(context: Context) {
     private val batteryReceiver = object : BroadcastReceiver() {
         override fun onReceive(receiverContext: Context?, intent: Intent?) {
             when (intent?.action) {
-                Intent.ACTION_BATTERY_CHANGED -> requestBatterySnapshot()
-                Intent.ACTION_SCREEN_ON -> requestBatterySnapshot(screenStateOverride = true)
-                Intent.ACTION_SCREEN_OFF -> requestBatterySnapshot(screenStateOverride = false)
+                Intent.ACTION_BATTERY_CHANGED -> requestBatteryReading()
+                Intent.ACTION_SCREEN_ON -> requestBatteryReading(screenStateOverride = true)
+                Intent.ACTION_SCREEN_OFF -> requestBatteryReading(screenStateOverride = false)
             }
         }
     }
@@ -171,36 +161,26 @@ class PowerStatsRepository(context: Context) {
     // =============================================================================================
 
     /**
-     * Starts (or resumes) monitoring: the 3 s heartbeat plus the battery and stats pipelines.
-     *
-     * The Shizuku permission dialog is shown immediately when the service is running but the app
-     * has not been granted yet (once per process). Without the grant there is no data at all — the
-     * UI shows its permission state and nothing is fabricated.
-     *
-     * A restored session keeps its original start time so "已使用" does not reset when the activity
-     * is recreated; a cold start with no persisted session begins a new one at the current level.
+     * Starts (or resumes) monitoring: the 3 s heartbeat, the battery reader and the stats pipeline.
+     * The Shizuku permission dialog is requested once per process when the service runs but the app
+     * has not been granted access yet.
      */
     fun startMonitoring() {
         if (monitoring) {
-            requestBatterySnapshot()
+            requestBatteryReading(force = true)
             restartStatsPipeline(showLoading = false)
             return
         }
         monitoring = true
         registerBatteryReceiver()
 
-        if (sessionStartMillis == null) {
-            beginSession(lastSnapshot?.levelPercent)
-        }
+        if (sessionStartMillis == null) beginSession(lastReading?.levelPercent ?: lastSnapshot?.levelPercent)
 
         lastPermissionCheckMillis = System.currentTimeMillis()
         refreshShizukuFlags()
         maybeRequestShizukuPermissionUpFront()
 
-        lastTickAtMillis = System.currentTimeMillis()
-        lastAccumulatorAtMillis = lastTickAtMillis
-        requestBatterySnapshot(screenStateOverride = null, force = true)
-
+        requestBatteryReading(screenStateOverride = null, force = true)
         tickJob = scope.launch {
             while (isActive) {
                 delay(PowerMath.TICK_INTERVAL_MILLIS)
@@ -208,31 +188,6 @@ class PowerStatsRepository(context: Context) {
             }
         }
         restartStatsPipeline(showLoading = true)
-    }
-
-    /**
-     * Asks for shell access as soon as the app starts, exactly once per process.
-     * If the service is not running, [PowerUiState.shizukuAvailable] stays `false` so the UI can
-     * tell the user to start Shizuku/Sui.
-     */
-    private fun maybeRequestShizukuPermissionUpFront() {
-        if (shizukuPermissionRequested || !ShizukuBridge.isServiceAvailable()) return
-        if (ShizukuBridge.hasPermission()) return
-        shizukuPermissionRequested = true
-        ShizukuBridge.requestPermission { granted -> onShizukuPermissionResult(granted) }
-    }
-
-    /** Applies the result of the Shizuku permission dialog (may arrive on the binder thread). */
-    private fun onShizukuPermissionResult(granted: Boolean) {
-        scope.launch {
-            shizukuGranted = granted
-            shizukuAvailable = !granted && ShizukuBridge.isServiceAvailable()
-            if (granted) {
-                requestBatterySnapshot(force = true)
-                restartStatsPipeline(showLoading = true)
-            }
-            publish()
-        }
     }
 
     /** Stops all pipelines. The persisted session is kept so the chart survives a restart. */
@@ -248,81 +203,39 @@ class PowerStatsRepository(context: Context) {
         persistSession()
     }
 
-    /**
-     * Forces an immediate stats/scenario refresh. Cancels the in-flight fetch so the next result is
-     * fresher instead of queued behind a slow `dumpsys` (the pipeline never overlaps anyway).
-     */
+    /** Re-reads the app list (labels/icons) and the system numbers. */
     fun refreshScenarios() {
         if (monitoring) {
             restartStatsPipeline(showLoading = true)
         } else {
-            // Not monitoring: still refresh the list once, without starting the loops.
             scope.launch {
                 _state.update { it.copy(loadingScenarios = true) }
-                runCatching { fetchStatsAndScenarios() }
+                runCatching { refreshStats() }
                 _state.update { it.copy(loadingScenarios = false) }
             }
         }
     }
 
     /**
-     * Archives the running session into `sessionHistory` (newest first, max 20), then wipes the
-     * samples / summary / session start / scenario list. Monitoring continues with a fresh session.
+     * Archives the running session into `sessionHistory` (newest first, max 20), wipes the samples /
+     * summary / session start / scenario list and resets the system counters through Shizuku.
      */
     fun clearSessionData() {
         val now = System.currentTimeMillis()
-        val start = sessionStartMillis
-        val endLevel = lastSnapshot?.levelPercent ?: startLevelPercent
-
-        if (start != null && now > start) {
-            val duration = now - start
-            val average = currentSessionAveragePower()
-            val record = SessionRecord(
-                startedAtMillis = start,
-                durationMillis = duration,
-                averagePowerWatts = average,
-                energyWattHours = average * duration / MILLIS_PER_HOUR,
-                startLevelPercent = startLevelPercent ?: endLevel ?: DEFAULT_LEVEL_PERCENT,
-                endLevelPercent = endLevel ?: DEFAULT_LEVEL_PERCENT,
-            )
-            sessionHistory = (listOf(record) + sessionHistory).take(MAX_SESSION_HISTORY)
-            store.saveHistory(sessionHistory)
-        }
-
-        windowSamples.clear()
-        chartSamples = emptyList()
-        historyChartSamples = emptyList()
-        historySeedAllowed = false
-        weightedPowerSum = 0.0
-        weightSum = 0.0
-        lastAccumulatorAtMillis = now
-        lastTickAtMillis = now
-        // Instantaneous power readings are *not* statistics: keep them so the first seconds after a
-        // clear still show the real draw instead of falling back to the 0.05 W floor.
-        energyAnchorWattHours = null
-        energyAnchorMillis = 0L
-        counterAnchorMicroAmpHours = null
-        counterAnchorMillis = 0L
-        visualCache = emptyMap()
-        scenarios = emptyList()
-        scenarioCandidates = emptyList()
-        // The system dump feeds both the summary and the app list in Shizuku mode: drop it so the
-        // freshly reset counters are picked up instead of the old cycle.
-        lastPowerDump = null
-        systemTimeOnBatteryMillis = 0L
-        systemStatsFetchedAtMillis = 0L
-        smoothedSystemAverageWatts = null
+        archiveCurrentSession(now, lastReading?.levelPercent ?: startLevelPercent)
+        resetSessionState(now, lastReading?.levelPercent ?: lastSnapshot?.levelPercent, allowHistorySeed = false)
 
         store.clearSession()
-        if (monitoring) {
-            beginSession(lastSnapshot?.levelPercent)
-        } else {
-            sessionStartMillis = null
-            startLevelPercent = lastSnapshot?.levelPercent ?: startLevelPercent
-        }
+        lastReading = null
+        lastSnapshot = null
+        latestPowerWatts = null
+        lastPowerDump = null
+        visualCache = emptyMap()
+        scenarios = emptyList()
 
         _state.update {
             it.copy(
+                snapshot = null,
                 summary = PowerSummary(0f, 0L, 0L),
                 chartSamples = emptyList(),
                 scenarios = emptyList(),
@@ -332,18 +245,18 @@ class PowerStatsRepository(context: Context) {
             )
         }
 
-        if (shizukuGranted) {
-            // Best effort: wipe the system's own batterystats so the next query really starts from
-            // zero (some ROMs refuse the command; that must not break the reset above).
-            scope.launch {
+        scope.launch {
+            if (shizukuGranted) {
+                // Best effort: wipe the system's own batterystats so the next query starts from zero.
                 withContext(Dispatchers.IO) {
                     runCatching { ShizukuBridge.exec("dumpsys batterystats --reset") }
                 }
-                delay(SCENARIO_REFRESH_AFTER_RESET_MILLIS)
-                if (isActive) restartStatsPipeline(showLoading = true)
             }
-        } else {
-            restartStatsPipeline(showLoading = true)
+            delay(SCENARIO_REFRESH_AFTER_RESET_MILLIS)
+            if (isActive) {
+                requestBatteryReading(force = true)
+                restartStatsPipeline(showLoading = true)
+            }
         }
     }
 
@@ -364,26 +277,22 @@ class PowerStatsRepository(context: Context) {
         _state.update { it.copy(sessionHistory = emptyList()) }
     }
 
-    // =============================================================================================
-    // Shizuku (optional shell access → system accounting)
-    // =============================================================================================
-
-    /** Re-reads the Shizuku state (service running? permission granted?) and publishes it. */
+    /** Re-reads the Shizuku state (service running? permission granted? root or shell?). */
     fun refreshShizukuState() {
         val wasGranted = shizukuGranted
         refreshShizukuFlags()
         if (wasGranted != shizukuGranted) {
-            if (!shizukuGranted) {
-                shizukuPowerWatts = null
-                smoothedSystemAverageWatts = null
+            if (shizukuGranted) {
+                requestBatteryReading(force = true)
+                restartStatsPipeline(showLoading = false)
+            } else {
+                clearUnavailableData()
             }
-            requestBatterySnapshot(force = true)
-            restartStatsPipeline(showLoading = false)
         }
         publish()
     }
 
-    /** Shows Shizuku's permission dialog (explicit user action, e.g. the "去授权" button). */
+    /** Shows Shizuku's permission dialog (explicit user action). */
     fun requestShizukuPermission() {
         if (!ShizukuBridge.isServiceAvailable()) {
             refreshShizukuState()
@@ -393,119 +302,80 @@ class PowerStatsRepository(context: Context) {
         ShizukuBridge.requestPermission { granted -> onShizukuPermissionResult(granted) }
     }
 
-    /** Reads the Shizuku flags without publishing. */
+    // =============================================================================================
+    // Shizuku / root flags
+    // =============================================================================================
+
+    /**
+     * Asks for shell access as soon as the app starts, exactly once per process. If the service is
+     * not running, [PowerUiState.shizukuAvailable] stays `false` so the UI can ask the user to
+     * start Shizuku/Sui.
+     */
+    private fun maybeRequestShizukuPermissionUpFront() {
+        if (shizukuPermissionRequested || !ShizukuBridge.isServiceAvailable()) return
+        if (ShizukuBridge.hasPermission()) return
+        shizukuPermissionRequested = true
+        ShizukuBridge.requestPermission { granted -> onShizukuPermissionResult(granted) }
+    }
+
+    /** Applies the result of the Shizuku permission dialog (may arrive on the binder thread). */
+    private fun onShizukuPermissionResult(granted: Boolean) {
+        scope.launch {
+            shizukuGranted = granted
+            shizukuAvailable = !granted && ShizukuBridge.isServiceAvailable()
+            rootAvailable = granted && ShizukuBridge.serverUid() == 0
+            if (granted) {
+                requestBatteryReading(force = true)
+                restartStatsPipeline(showLoading = true)
+            }
+            publish()
+        }
+    }
+
+    /** Reads the Shizuku flags (and whether the service runs as root) without publishing. */
     private fun refreshShizukuFlags() {
         val available = runCatching { ShizukuBridge.isServiceAvailable() }.getOrDefault(false)
         val granted = available && runCatching { ShizukuBridge.hasPermission() }.getOrDefault(false)
         shizukuGranted = granted
         shizukuAvailable = available && !granted
+        rootAvailable = granted && ShizukuBridge.serverUid() == 0
+    }
+
+    /** Permission revoked / service gone: nothing can be read any more. */
+    private fun clearUnavailableData() {
+        lastReading = null
+        lastSnapshot = null
+        latestPowerWatts = null
+        lastPowerDump = null
+        lastValidPowerWatts = null
+        counterReferenceWatts = null
+        counterAnchorMicroAmpHours = null
+        scenarios = emptyList()
+        visualCache = emptyMap()
+        foregroundIntervals = emptyMap()
+        intervalIndex = emptyList()
+        _state.update {
+            it.copy(
+                snapshot = null,
+                summary = PowerSummary(0f, 0L, 0L),
+                scenarios = emptyList(),
+                loadingScenarios = false,
+            )
+        }
     }
 
     // =============================================================================================
-    // 1 s heartbeat
+    // Heartbeat
     // =============================================================================================
 
-    /**
-     * One heartbeat of the whole screen: fold the latest power into the session average, advance
-     * the chart's right edge, refresh the battery snapshot (single-flight) and emit the state.
-     */
     private fun onTick() {
         val now = System.currentTimeMillis()
-        updateSessionAccumulator(now)
-        advanceChartPoint(now)
         maybeRefreshShizukuState(now)
-        requestBatterySnapshot()
-        updateSystemAverageSmoothing(now)
+        requestBatteryReading()
         publish()
     }
 
-    /** Time-weighted session mean, folded in on every tick so the average moves with the data. */
-    private fun updateSessionAccumulator(nowMillis: Long) {
-        val power = latestPowerWatts ?: lastValidPowerWatts
-        val previous = lastAccumulatorAtMillis
-        if (previous <= 0L) {
-            lastAccumulatorAtMillis = nowMillis
-            return
-        }
-        if (power == null) return
-        val delta = (nowMillis - previous).coerceIn(0L, PowerMath.MAX_SAMPLE_WEIGHT_MILLIS)
-        lastAccumulatorAtMillis = nowMillis
-        if (delta <= 0L) return
-        weightedPowerSum += power.toDouble() * delta
-        weightSum += delta.toDouble()
-    }
-
-    /**
-     * Advances the "使用过程" curve by one second.
-     *
-     * A point is appended only when the level or the segment style changes; otherwise the newest
-     * point's timestamp is moved forward, so the right edge stays live without storing 2 700
-     * identical points.
-     */
-    private fun advanceChartPoint(nowMillis: Long) {
-        if (!monitoring || sessionStartMillis == null) return
-        val snapshot = lastSnapshot ?: return
-
-        val previousTick = lastTickAtMillis
-        val missedRecord = previousTick > 0L && PowerMath.isMissedRecord(nowMillis - previousTick)
-        lastTickAtMillis = nowMillis
-
-        val style = PowerMath.segmentStyle(snapshot.screenOn, missedRecord)
-        val level = snapshot.levelPercent
-        val last = windowSamples.lastOrNull()
-
-        if (last != null && last.levelPercent == level && last.style == style) {
-            windowSamples[windowSamples.lastIndex] = last.copy(timestampMillis = nowMillis)
-        } else {
-            windowSamples.add(
-                PowerSample(
-                    timestampMillis = nowMillis,
-                    levelPercent = level,
-                    voltageVolts = snapshot.voltageVolts,
-                    temperatureCelsius = snapshot.temperatureCelsius,
-                    currentMilliAmps = snapshot.currentMilliAmps,
-                    powerWatts = latestPowerWatts ?: lastValidPowerWatts ?: snapshot.powerWatts,
-                    charging = snapshot.charging,
-                    remainingEnergyWattHours = snapshot.remainingEnergyWattHours,
-                    screenOn = snapshot.screenOn,
-                    style = style,
-                ),
-            )
-        }
-        trimWindow(nowMillis)
-        rebuildChartSamples()
-        persistSamplesIfDue(nowMillis)
-    }
-
-    /** Rebuilds the lightweight chart list from the detailed window (≤ a few hundred points). */
-    private fun rebuildChartSamples() {
-        val samples = ArrayList<ChartSample>(windowSamples.size)
-        for (sample in windowSamples) {
-            samples += ChartSample(sample.timestampMillis, sample.levelPercent, sample.style)
-        }
-        chartSamples = samples
-    }
-
-    /** Drops everything older than the chart window, then enforces a hard point cap. */
-    private fun trimWindow(nowMillis: Long) {
-        val threshold = nowMillis - PowerMath.CHART_WINDOW_MILLIS
-        while (windowSamples.isNotEmpty() && windowSamples.first().timestampMillis < threshold) {
-            windowSamples.removeAt(0)
-        }
-        while (windowSamples.size > MAX_CHART_SAMPLES) {
-            windowSamples.removeAt(0)
-        }
-    }
-
-    /** `SharedPreferences` is only rewritten every [SAMPLE_PERSIST_INTERVAL_MILLIS], not per tick. */
-    private fun persistSamplesIfDue(nowMillis: Long) {
-        if (nowMillis - lastSamplesPersistedAtMillis < SAMPLE_PERSIST_INTERVAL_MILLIS) return
-        lastSamplesPersistedAtMillis = nowMillis
-        store.saveSamples(windowSamples)
-        store.saveAccumulators(weightedPowerSum, weightSum)
-    }
-
-    /** Periodically notices Shizuku (or Sui) being started / stopped / revoked. */
+    /** Notices Shizuku (or Sui) being started / stopped / revoked. */
     private fun maybeRefreshShizukuState(nowMillis: Long) {
         if (nowMillis - lastPermissionCheckMillis < PERMISSION_CHECK_INTERVAL_MILLIS) return
         lastPermissionCheckMillis = nowMillis
@@ -515,213 +385,437 @@ class PowerStatsRepository(context: Context) {
         if (wasGranted == shizukuGranted) return
 
         if (shizukuGranted) {
-            requestBatterySnapshot(force = true)
+            requestBatteryReading(force = true)
             restartStatsPipeline(showLoading = false)
         } else {
-            // Permission revoked: stop showing numbers that can no longer be read.
-            shizukuPowerWatts = null
-            smoothedSystemAverageWatts = null
-            lastPowerDump = null
-            lastBatteryDump = null
-            scenarios = emptyList()
-            scenarioCandidates = emptyList()
-            foregroundIntervals = emptyMap()
-            _state.update {
-                it.copy(
-                    snapshot = null,
-                    summary = PowerSummary(0f, 0L, 0L),
-                    scenarios = emptyList(),
-                    loadingScenarios = false,
-                )
-            }
+            clearUnavailableData()
         }
     }
 
     // =============================================================================================
-    // Battery snapshot pipeline (single-flight, once per tick)
+    // Battery reader (sysfs when root, `dumpsys battery` for shell)
     // =============================================================================================
 
     /**
-     * Refreshes the battery snapshot if none is in flight: one `dumpsys battery` per tick
-     * (~100 ms) executed on `Dispatchers.IO`. A slow exec simply means the next tick re-emits the
-     * previous numbers. Without the Shizuku permission there is nothing to read and no state is
-     * fabricated.
+     * Single-flight battery read; one exec per tick. A slow exec simply means the next tick re-emits
+     * the previous numbers. Nothing is read without the Shizuku permission.
      */
-    private fun requestBatterySnapshot(screenStateOverride: Boolean? = null, force: Boolean = false) {
+    private fun requestBatteryReading(screenStateOverride: Boolean? = null, force: Boolean = false) {
         if (!monitoring && !force) return
         if (!shizukuGranted) return
         if (batteryJob?.isActive == true) return
 
         batteryJob = scope.launch {
-            val text = withContext(Dispatchers.IO) { ShizukuBridge.exec("dumpsys battery") }
-            val dump = text?.let {
-                runCatching { SystemBatteryStatsSource.parseBatteryDump(it) }.getOrNull()
+            val reading = withContext(Dispatchers.IO) { readBattery() }
+            if (reading != null) handleBatteryReading(reading, screenStateOverride)
+        }
+    }
+
+    private suspend fun readBattery(): RawBatteryReading? {
+        if (rootAvailable) {
+            val sysfs = withContext(Dispatchers.IO) {
+                val text = ShizukuBridge.exec(SysfsBatterySource.COMMAND)
+                SysfsBatterySource.parse(text)
             }
-            if (dump != null) {
-                val now = System.currentTimeMillis()
-                updateChargeCounterPower(dump, now)
-                lastBatteryDump = dump
-                lastBatteryDumpMillis = now
-            }
-            applySnapshot(dump, screenStateOverride)
+            if (sysfs != null) return sysfs
+        }
+        return withContext(Dispatchers.IO) {
+            val text = ShizukuBridge.exec("dumpsys battery")
+            SystemBatteryStatsSource.parseBatteryDump(text)?.toRawReading()
         }
     }
 
     /**
-     * Turns the charge-counter change between two `dumpsys battery` reads into a wattage.
-     * The counter moves in 1 mAh steps (~every 5 s at 0.6 A), so the anchor is kept until it moves
-     * and the window is long enough for the step to mean something.
+     * Reference power from the fuel gauge: `ΔµAh × V / Δt`. The counter is unambiguous, so it is
+     * what every raw current reading is calibrated against. Kept for a while so a slowly moving
+     * counter does not blank the display.
      */
-    private fun updateChargeCounterPower(dump: SystemBatteryStatsSource.BatteryDump, nowMillis: Long) {
-        val counter = dump.chargeCounterMicroAmpHours ?: return
-        val anchor = counterAnchorMicroAmpHours
-        val anchorAt = counterAnchorMillis
-        if (anchor == null || anchorAt <= 0L) {
-            counterAnchorMicroAmpHours = counter
-            counterAnchorMillis = nowMillis
-            return
+    private fun updateCounterReference(raw: RawBatteryReading, nowMillis: Long): Float? {
+        val counter = raw.chargeCounterMicroAmpHours
+        if (counter != null && raw.voltageVolts > 0f) {
+            val anchor = counterAnchorMicroAmpHours
+            val anchorAt = counterAnchorMillis
+            if (anchor == null || anchorAt <= 0L) {
+                counterAnchorMicroAmpHours = counter
+                counterAnchorMillis = nowMillis
+            } else {
+                val elapsedMillis = nowMillis - anchorAt
+                val deltaMicroAmpHours = abs(counter - anchor)
+                if (elapsedMillis >= MIN_COUNTER_WINDOW_MILLIS && deltaMicroAmpHours > 0L) {
+                    val hours = elapsedMillis / 3_600_000f
+                    if (hours > 0f) {
+                        val watts = deltaMicroAmpHours / 1_000_000f * raw.voltageVolts / hours
+                        if (watts in PowerMath.MIN_POWER_WATTS..PowerMath.MAX_POWER_WATTS) {
+                            counterReferenceWatts = watts
+                            counterReferenceAtMillis = nowMillis
+                        }
+                    }
+                    counterAnchorMicroAmpHours = counter
+                    counterAnchorMillis = nowMillis
+                }
+            }
         }
+        val reference = counterReferenceWatts ?: return null
+        if (nowMillis - counterReferenceAtMillis > COUNTER_REFERENCE_VALIDITY_MILLIS) return null
+        return reference
+    }
 
-        val elapsedMillis = nowMillis - anchorAt
-        if (elapsedMillis <= 0L) {
-            counterAnchorMicroAmpHours = counter
-            counterAnchorMillis = nowMillis
-            return
-        }
-        val deltaMicroAmpHours = abs(counter - anchor)
-        if (deltaMicroAmpHours <= 0L) return
-        if (elapsedMillis < MIN_COUNTER_POWER_WINDOW_MILLIS) return
+    /**
+     * Turns a raw reading into a calibrated one. Nothing is returned until the charge-counter
+     * reference exists; when the raw sensor is missing, the counter power itself implies the current.
+     */
+    private fun calibrateReading(raw: RawBatteryReading, referencePowerWatts: Float?): BatteryReading? {
+        val discharging = raw.discharging
+        val calibratedCurrent: Float = raw.rawCurrent?.let { rawCurrent ->
+            CurrentCalibrator.calibrate(
+                rawCurrent = rawCurrent,
+                voltageVolts = raw.voltageVolts,
+                referencePowerWatts = referencePowerWatts,
+                discharging = discharging,
+            )?.milliAmps
+        } ?: referencePowerWatts?.let {
+            CurrentCalibrator.currentFromPower(it, raw.voltageVolts, discharging)
+        } ?: return null
 
-        val voltage = dump.voltageVolts ?: lastSnapshot?.voltageVolts ?: DEFAULT_VOLTAGE_VOLTS
-        val hours = elapsedMillis / 3_600_000f
-        if (hours <= 0f) return
-        shizukuPowerWatts = PowerMath.clampPower(
-            deltaMicroAmpHours / 1_000_000f * voltage / hours,
+        val powerWatts = abs(calibratedCurrent) * raw.voltageVolts / 1000f
+        if (powerWatts < PowerMath.MIN_POWER_WATTS || powerWatts > PowerMath.MAX_POWER_WATTS) return null
+        return BatteryReading(
+            levelPercent = raw.levelPercent,
+            voltageVolts = raw.voltageVolts,
+            currentMilliAmps = calibratedCurrent,
+            temperatureCelsius = raw.temperatureCelsius,
+            status = raw.status,
+            chargeCounterMicroAmpHours = raw.chargeCounterMicroAmpHours,
+            chargeFullMilliAmpHours = raw.chargeFullMilliAmpHours,
         )
-        counterAnchorMicroAmpHours = counter
-        counterAnchorMillis = nowMillis
     }
 
-    /**
-     * Folds a `dumpsys battery` result into [lastSnapshot].
-     *
-     * Every value comes from the dump (level / voltage / tenths of °C / charge counter / status);
-     * the screen state comes from the broadcast override or `PowerManager`. Power is the
-     * charge-counter delta when it moved, otherwise the fuel-gauge delta or the last good value.
-     */
-    private fun applySnapshot(
-        incoming: SystemBatteryStatsSource.BatteryDump?,
-        screenStateOverride: Boolean?,
-    ) {
-        if (!shizukuGranted) return
+    private fun handleBatteryReading(raw: RawBatteryReading, screenStateOverride: Boolean?) {
         val now = System.currentTimeMillis()
-        val dump = incoming ?: lastBatteryDump
-            ?.takeIf { now - lastBatteryDumpMillis <= SHIZUKU_DUMP_FRESH_MILLIS }
-            ?: return
+        lastRawReading = raw
+        lastReadingAtMillis = now
+        val screenOn = screenStateOverride ?: lastScreenOn ?: sampler.isScreenOn()
+        lastScreenOn = screenOn
 
-        val voltage = dump.voltageVolts ?: lastSnapshot?.voltageVolts ?: DEFAULT_VOLTAGE_VOLTS
-        val levelPercent = dump.levelPercent ?: lastSnapshot?.levelPercent ?: 0
-        val temperatureCelsius = dump.temperatureCelsius ?: lastSnapshot?.temperatureCelsius ?: 0f
-        val charging = dump.charging
-        val screenOn = screenStateOverride ?: lastSnapshot?.screenOn ?: sampler.isScreenOn()
-        val currentMilliAmps = dump.currentMilliAmps
-            ?.let { if (charging) it else -it }
-            ?: lastSnapshot?.currentMilliAmps
-            ?: 0f
-
-        val energyFromCounter = PowerMath.energyFromChargeCounter(
-            dump.chargeCounterMicroAmpHours,
-            voltage,
-        )
-        val remainingEnergyWattHours = energyFromCounter
-            ?: PowerMath.energyFromLevelPercent(
-                levelPercent = levelPercent,
-                voltageVolts = voltage,
-                capacityMilliAmpHours = designCapacityMilliAmpHours?.toFloat()
-                    ?: PowerMath.FALLBACK_CAPACITY_MILLIAMP_HOURS,
+        val reference = updateCounterReference(raw, now)
+        val reading = calibrateReading(raw, reference)
+        if (reading == null) {
+            // No trustworthy current yet (right after start-up): keep the last power, do not sample.
+            lastSnapshot = buildSnapshot(
+                raw = raw,
+                screenOn = screenOn,
+                nowMillis = now,
+                currentMilliAmps = 0f,
+                powerWatts = lastValidPowerWatts ?: 0f,
             )
-
-        // NOTE: the OEM `Battery current : N` line of `dumpsys battery` is *not* the pack current on
-        // this ROM (it reads ~146 mA while the fuel gauge shows ~620 mA), so it is used for display
-        // only and never for power. The charge-counter delta is the authority.
-        val energyEstimate = updateEnergyAnchor(remainingEnergyWattHours, energyFromCounter != null, now)
-        val measuredPower = shizukuPowerWatts ?: energyEstimate
-        val powerWatts = measuredPower
-            ?: smoothedSystemAverageWatts
-            ?: lastValidPowerWatts
-            ?: currentSessionAveragePower().takeIf { it > 0f }
-            ?: PowerMath.MIN_POWER_WATTS
-        if (measuredPower != null) lastValidPowerWatts = powerWatts
-
-        recentPowers.addLast(powerWatts)
-        while (recentPowers.size > PowerMath.SMOOTHING_WINDOW) recentPowers.removeFirst()
-        val smoothedPower = recentPowers.average().toFloat()
-
-        val snapshot = BatterySnapshot(
-            timestampMillis = now,
-            levelPercent = levelPercent,
-            voltageVolts = voltage,
-            temperatureCelsius = temperatureCelsius,
-            currentMilliAmps = currentMilliAmps,
-            powerWatts = smoothedPower,
-            charging = charging,
-            remainingEnergyWattHours = remainingEnergyWattHours,
-            screenOn = screenOn,
-        )
-        lastSnapshot = snapshot
-        latestPowerWatts = smoothedPower
-
-        if (monitoring && sessionStartMillis != null) {
-            // Records a style change (screen on/off) immediately instead of waiting for the tick.
-            advanceChartPoint(now)
+            publish()
+            return
         }
+
+        val powerWatts = abs(reading.currentMilliAmps) * reading.voltageVolts / 1000f
+        lastReading = reading
+        lastValidPowerWatts = powerWatts
+        lastSnapshot = buildSnapshot(
+            raw = raw,
+            screenOn = screenOn,
+            nowMillis = now,
+            currentMilliAmps = reading.currentMilliAmps,
+            powerWatts = powerWatts,
+        )
+        latestPowerWatts = powerWatts
+        handleSampling(reading, screenOn, now)
         publish()
     }
 
+    private fun buildSnapshot(
+        raw: RawBatteryReading,
+        screenOn: Boolean,
+        nowMillis: Long,
+        currentMilliAmps: Float,
+        powerWatts: Float,
+    ): BatterySnapshot = BatterySnapshot(
+        timestampMillis = nowMillis,
+        levelPercent = raw.levelPercent,
+        voltageVolts = raw.voltageVolts,
+        temperatureCelsius = raw.temperatureCelsius,
+        currentMilliAmps = currentMilliAmps,
+        powerWatts = powerWatts,
+        charging = raw.charging,
+        remainingEnergyWattHours = PowerMath.remainingWattHours(
+            chargeCounterMicroAmpHours = raw.chargeCounterMicroAmpHours,
+            voltageVolts = raw.voltageVolts,
+            levelPercent = raw.levelPercent,
+            chargeFullMilliAmpHours = effectiveChargeFullMilliAmpHours(raw),
+        ),
+        screenOn = screenOn,
+    )
+
+    // =============================================================================================
+    // Sampling (Scene's Analyser-Power rules)
+    // =============================================================================================
+
     /**
-     * Keeps a stored-energy "anchor" and turns the change since it into an average power.
-     * Shorter than [MIN_FUEL_GAUGE_WINDOW_MILLIS] a charge-counter step is just resolution noise.
+     * Records a sample only while discharging and the screen is on. When the screen turns off one
+     * final `screenOn = false` sample is stored (that is Scene's grey chart segment); charging
+     * periods record nothing at all.
      */
-    private fun updateEnergyAnchor(currentWattHours: Float?, precise: Boolean, nowMillis: Long): Float? {
-        if (currentWattHours == null) return null
-        val anchor = energyAnchorWattHours
-        val anchorMillis = energyAnchorMillis
-        if (anchor == null || anchorMillis <= 0L) {
-            energyAnchorWattHours = currentWattHours
-            energyAnchorMillis = nowMillis
-            return null
+    private fun handleSampling(reading: BatteryReading, screenOn: Boolean, nowMillis: Long) {
+        when {
+            reading.charging -> lastSampleWasScreenOn = false
+
+            reading.discharging && screenOn -> recordSample(reading, screenOn = true, nowMillis = nowMillis)
+
+            reading.discharging && !screenOn -> {
+                if (lastSampleWasScreenOn) recordSample(reading, screenOn = false, nowMillis = nowMillis)
+                lastSampleWasScreenOn = false
+            }
+
+            else -> lastSampleWasScreenOn = false
+        }
+    }
+
+    private fun recordSample(reading: BatteryReading, screenOn: Boolean, nowMillis: Long) {
+        if (sessionStartMillis == null) beginSession(reading.levelPercent)
+        if (shouldStartNewSession(reading, nowMillis)) beginNewSession(reading.levelPercent)
+
+        if (screenOn) {
+            val powerMilliWatts = reading.currentMilliAmps * reading.voltageVolts
+            sessionSampleCount++
+            sessionPowerMilliWattSum += powerMilliWatts
+            // Scene's SQL only filters `package != ''`, so our own package is listed too.
+            val packageName = packageAt(nowMillis)
+            if (packageName != null) {
+                val aggregate = packageAggregates[packageName] ?: PackageAggregate()
+                packageAggregates[packageName] = aggregate.add(
+                    currentMilliAmps = reading.currentMilliAmps,
+                    powerMilliWatts = powerMilliWatts,
+                    temperatureCelsius = reading.temperatureCelsius,
+                )
+            } else {
+                unattributedSampleSeen = true
+            }
         }
 
-        val elapsedMillis = nowMillis - anchorMillis
-        if (elapsedMillis <= 0L) {
-            energyAnchorWattHours = currentWattHours
-            energyAnchorMillis = nowMillis
-            return null
-        }
+        appendChartPoint(reading, screenOn, nowMillis)
+        lastSampleAtMillis = nowMillis
+        lastSampleLevel = reading.levelPercent
+        lastSampleWasScreenOn = screenOn
+        persistSessionIfDue(nowMillis)
+    }
 
-        val minDelta = if (precise) MIN_FUEL_GAUGE_STEP_WATT_HOURS else MIN_LEVEL_STEP_WATT_HOURS
-        val delta = abs(anchor - currentWattHours)
-        if (delta < minDelta) return null
-        if (elapsedMillis < (if (precise) MIN_FUEL_GAUGE_WINDOW_MILLIS else MIN_LEVEL_WINDOW_MILLIS)) {
-            return null
-        }
+    /**
+     * Scene starts a new session when the gap since the previous sample exceeds 24 h, when the
+     * battery level rose during a gap longer than 30 s, or when the current reading is insane.
+     */
+    private fun shouldStartNewSession(reading: BatteryReading, nowMillis: Long): Boolean {
+        val previous = lastSampleAtMillis
+        if (previous <= 0L) return false
+        val gap = nowMillis - previous
+        if (gap > SESSION_MAX_GAP_MILLIS) return true
+        if (gap > SESSION_LEVEL_RISE_GAP_MILLIS && reading.levelPercent > lastSampleLevel) return true
+        return abs(reading.currentMilliAmps) > PowerMath.MAX_PLAUSIBLE_CURRENT_MILLIAMPS
+    }
 
-        energyAnchorWattHours = currentWattHours
-        energyAnchorMillis = nowMillis
-        return PowerMath.powerFromEnergyDelta(anchor, currentWattHours, elapsedMillis)
+    private fun beginNewSession(levelPercent: Int) {
+        val now = System.currentTimeMillis()
+        archiveCurrentSession(now, levelPercent)
+        resetSessionState(now, levelPercent, allowHistorySeed = false)
+        persistSession()
     }
 
     // =============================================================================================
-    // Stats + scenario pipeline (serial, never overlapping)
+    // Chart
+    // =============================================================================================
+
+    /** Appends one chart point; gaps over 10 s become the dotted `MissedRecord*` variants. */
+    private fun appendChartPoint(reading: BatteryReading, screenOn: Boolean, nowMillis: Long) {
+        val previous = lastChartPointAtMillis
+        val missed = previous > 0L && PowerMath.isMissedRecord(nowMillis - previous)
+        val style = PowerMath.segmentStyle(screenOn, missed)
+        windowSamples.add(
+            PowerSample(
+                timestampMillis = nowMillis,
+                levelPercent = reading.levelPercent,
+                voltageVolts = reading.voltageVolts,
+                temperatureCelsius = reading.temperatureCelsius,
+                currentMilliAmps = reading.currentMilliAmps,
+                powerMilliWatts = reading.currentMilliAmps * reading.voltageVolts,
+                charging = reading.charging,
+                remainingEnergyWattHours = lastSnapshot?.remainingEnergyWattHours,
+                screenOn = screenOn,
+                style = style,
+            ),
+        )
+        lastChartPointAtMillis = nowMillis
+        trimChartWindow(nowMillis)
+        rebuildChartSamples()
+    }
+
+    private fun trimChartWindow(nowMillis: Long) {
+        val threshold = nowMillis - PowerMath.CHART_WINDOW_MILLIS
+        while (windowSamples.isNotEmpty() && windowSamples.first().timestampMillis < threshold) {
+            windowSamples.removeAt(0)
+        }
+        while (windowSamples.size > MAX_CHART_SAMPLES) windowSamples.removeAt(0)
+    }
+
+    private fun rebuildChartSamples() {
+        chartSamples = windowSamples.map {
+            ChartSample(it.timestampMillis, it.levelPercent, it.style)
+        }
+    }
+
+    /** Converts seeded history points; seeded points use the wider gap threshold to stay solid. */
+    private fun toChartSamples(
+        points: List<SystemBatteryStatsSource.HistoryPoint>,
+    ): List<ChartSample> {
+        if (points.isEmpty()) return emptyList()
+        val samples = ArrayList<ChartSample>(points.size)
+        var previousTimestamp = 0L
+        for (point in points) {
+            val missed = previousTimestamp > 0L &&
+                PowerMath.isMissedRecord(
+                    point.timestampMillis - previousTimestamp,
+                    PowerMath.HISTORY_MISSED_GAP_MILLIS,
+                )
+            samples += ChartSample(
+                timestampMillis = point.timestampMillis,
+                levelPercent = point.levelPercent,
+                style = PowerMath.segmentStyle(point.screenOn, missed),
+            )
+            previousTimestamp = point.timestampMillis
+        }
+        return samples
+    }
+
+    private fun mergedChartSamples(): List<ChartSample> {
+        val live = chartSamples
+        val history = historyChartSamples
+        if (history.isEmpty()) return live
+        if (live.isEmpty()) return history
+        val firstLive = live.first().timestampMillis
+        val merged = ArrayList<ChartSample>(history.size + live.size)
+        for (sample in history) if (sample.timestampMillis < firstLive) merged += sample
+        merged += live
+        return merged
+    }
+
+    // =============================================================================================
+    // Summary / capacity
+    // =============================================================================================
+
+    private fun currentSummary(): PowerSummary {
+        if (!shizukuGranted || sessionSampleCount <= 0) return PowerSummary(0f, 0L, 0L)
+        val averagePowerWatts = (-sessionPowerMilliWattSum / sessionSampleCount / 1000.0)
+            .toFloat()
+            .takeIf { it.isFinite() } ?: 0f
+        val usedMillis = sessionSampleCount.toLong() * PowerMath.TICK_INTERVAL_MILLIS
+        return PowerSummary(
+            averagePowerWatts = averagePowerWatts,
+            usedMillis = usedMillis,
+            estimatedRuntimeMillis = PowerMath.estimatedRuntimeMillis(
+                remainingWattHours = lastSnapshot?.remainingEnergyWattHours,
+                averagePowerWatts = averagePowerWatts,
+            ),
+        )
+    }
+
+    /** Full-pack watt-hours (`chargeFull × 3.86 V`), computed once per process. */
+    private fun fullCapacityWattHours(): Float? {
+        fullCapacityWattHoursCache?.let { return it }
+        val chargeFull = effectiveChargeFullMilliAmpHours(lastRawReading) ?: return null
+        val wattHours = PowerMath.fullCapacityWattHours(chargeFull, lastRawReading?.levelPercent ?: 100)
+            ?: return null
+        fullCapacityWattHoursCache = wattHours
+        return wattHours
+    }
+
+    /** `chargeFull` from sysfs when root, otherwise the capacity the system learned. */
+    private fun effectiveChargeFullMilliAmpHours(reading: RawBatteryReading?): Float? {
+        reading?.chargeFullMilliAmpHours?.let {
+            chargeFullMilliAmpHours = it
+            return it
+        }
+        chargeFullMilliAmpHours?.let { return it }
+        val learned = learnedCapacityMilliAmpHours ?: designCapacityMilliAmpHours ?: return null
+        val value = learned.toFloat()
+        chargeFullMilliAmpHours = value
+        return value
+    }
+
+    // =============================================================================================
+    // Per-app attribution
     // =============================================================================================
 
     /**
-     * (Re)starts the serial stats pipeline.
+     * Foreground package at [timestampMillis] according to the batterystats history intervals.
      *
-     * The loop only starts the next `dumpsys` after the previous one finished, plus a ≥1 s floor,
-     * so work can never pile up. [immediate] cancels an in-flight fetch, so a deliberate refresh is
-     * not stuck behind a slow exec.
+     * The history is a dump: when the user switches apps between two fetches, the new interval does
+     * not exist yet. In that case the most recently ended interval is used when it ended within
+     * [PACKAGE_FALLBACK_WINDOW_MILLIS] (the app we are most likely looking at), instead of dropping
+     * the sample.
      */
+    private fun packageAt(timestampMillis: Long): String? {
+        var fallback: IntervalEntry? = null
+        for (entry in intervalIndex) {
+            if (timestampMillis in entry.startMillis until entry.endMillis) return entry.packageName
+            if (entry.endMillis <= timestampMillis &&
+                timestampMillis - entry.endMillis <= PACKAGE_FALLBACK_WINDOW_MILLIS
+            ) {
+                if (fallback == null || entry.endMillis > fallback.endMillis) fallback = entry
+            }
+        }
+        return fallback?.packageName
+    }
+
+    private fun rebuildIntervalIndex() {
+        if (foregroundIntervals.isEmpty()) {
+            intervalIndex = emptyList()
+            return
+        }
+        val now = System.currentTimeMillis()
+        val entries = ArrayList<IntervalEntry>()
+        for ((packageName, intervals) in foregroundIntervals) {
+            for ((index, interval) in intervals.withIndex()) {
+                val isLast = index == intervals.lastIndex
+                val stillOpen = intervalsFetchedAtMillis > 0L &&
+                    interval.endMillis >= intervalsFetchedAtMillis - OPEN_INTERVAL_SLACK_MILLIS
+                val end = if (isLast && stillOpen) maxOf(interval.endMillis, now) else interval.endMillis
+                entries += IntervalEntry(interval.startMillis, end, packageName)
+            }
+        }
+        entries.sortBy { it.startMillis }
+        intervalIndex = entries
+    }
+
+    private fun rebuildScenariosIfChanged() {
+        val built = buildScenarios()
+        if (built != scenarios) scenarios = built
+    }
+
+    private fun buildScenarios(): List<UsageScenario> {
+        val result = ArrayList<UsageScenario>(packageAggregates.size)
+        for ((packageName, aggregate) in packageAggregates) {
+            if (aggregate.sampleCount <= 0) continue
+            val visual = visualCache[packageName] ?: continue
+            result += UsageScenario(
+                packageName = packageName,
+                label = visual.label,
+                icon = visual.icon,
+                durationMillis = aggregate.sampleCount.toLong() * PowerMath.TICK_INTERVAL_MILLIS,
+                averagePowerWatts = aggregate.averagePowerWatts.let { if (it.isFinite()) it else 0f },
+                averageTemperatureCelsius = aggregate.averageTemperatureCelsius,
+                maxTemperatureCelsius = aggregate.temperatureMax.takeIf { it.isFinite() } ?: 0f,
+                averageCurrentMilliAmps = aggregate.averageCurrentMilliAmps,
+            )
+        }
+        return result.sortedByDescending { it.averagePowerWatts }
+    }
+
+    // =============================================================================================
+    // Stats pipeline (foreground intervals, learned capacity, chart history)
+    // =============================================================================================
+
     private fun restartStatsPipeline(showLoading: Boolean = false) {
         statsJob?.cancel()
         if (showLoading) _state.update { it.copy(loadingScenarios = true) }
@@ -729,8 +823,8 @@ class PowerStatsRepository(context: Context) {
         statsJob = scope.launch {
             while (isActive) {
                 val startedAt = SystemClock.elapsedRealtime()
-                runCatching { fetchStatsAndScenarios() }
-                _state.update { state -> state.copy(loadingScenarios = false) }
+                runCatching { refreshStats() }
+                _state.update { it.copy(loadingScenarios = false) }
                 val elapsed = SystemClock.elapsedRealtime() - startedAt
                 val wait = (MIN_STATS_REFRESH_INTERVAL_MILLIS - elapsed).coerceAtLeast(0L)
                 if (wait > 0L) delay(wait)
@@ -738,31 +832,15 @@ class PowerStatsRepository(context: Context) {
         }
     }
 
-    /** One iteration of the stats pipeline; suspends on IO, applies on main. */
-    private suspend fun fetchStatsAndScenarios() {
+    private suspend fun refreshStats() {
         refreshShizukuFlags()
         if (!shizukuGranted) {
-            // Nothing can be read without the shell permission: drop the list instead of guessing.
-            scenarioCandidates = emptyList()
-            scenarios = emptyList()
-            visualCache = emptyMap()
-            _state.update { it.copy(scenarios = emptyList(), loadingScenarios = false) }
+            clearUnavailableData()
             return
         }
 
         val fetchedAt = System.currentTimeMillis()
-        // The full history dump is ~150 KiB and is only needed for the chart seed and the
-        // foreground intervals: start-up + hourly, plus an early refresh when an app newly came to
-        // the foreground (rate-limited) so its row gets the whole-device attribution.
-        val needsIntervals = lastPowerDump?.let { dump ->
-            withContext(Dispatchers.IO) { hasForegroundWithoutIntervals(dump) }
-        } ?: false
-        val timeSinceHistory = fetchedAt - lastHistoryFetchMillis
-        val historyDue = historySeedAllowed && (
-            lastHistoryFetchMillis == 0L ||
-                timeSinceHistory >= HISTORY_REFRESH_INTERVAL_MILLIS ||
-                (needsIntervals && timeSinceHistory >= MIN_HISTORY_RETRY_MILLIS)
-            )
+        val historyDue = isHistoryDue(fetchedAt)
         val statsText = withContext(Dispatchers.IO) {
             if (historyDue) {
                 ShizukuBridge.exec("dumpsys batterystats --charged --history")
@@ -775,309 +853,69 @@ class PowerStatsRepository(context: Context) {
             val powerDump = SystemBatteryStatsSource.parsePowerDump(statsText)
             val windowStart = fetchedAt - PowerMath.CHART_WINDOW_MILLIS
             val windowEnd = fetchedAt + HISTORY_CLOCK_SKEW_MILLIS
-            val history = if (historyDue) {
-                SystemBatteryStatsSource.parseBatteryHistory(statsText, windowStart, windowEnd, fetchedAt)
-            } else {
-                emptyList()
-            }
-            val intervals = if (historyDue) {
-                SystemBatteryStatsSource.parseForegroundIntervals(statsText, windowStart, windowEnd, fetchedAt)
-            } else {
-                null
+            var intervals: Map<String, List<TimeInterval>>? = null
+            var history: List<SystemBatteryStatsSource.HistoryPoint> = emptyList()
+            if (historyDue) {
+                intervals = SystemBatteryStatsSource.parseForegroundIntervals(
+                    statsText,
+                    windowStart,
+                    windowEnd,
+                    fetchedAt,
+                )
+                if (historySeedAllowed && windowSamples.isEmpty()) {
+                    history = SystemBatteryStatsSource.parseBatteryHistory(
+                        statsText,
+                        windowStart,
+                        windowEnd,
+                        fetchedAt,
+                    )
+                }
             }
             applyStats(powerDump, history, intervals, fetchedAt)
             if (historyDue) lastHistoryFetchMillis = fetchedAt
         }
 
-        val candidates = withContext(Dispatchers.IO) {
-            runCatching { resolveShizukuCandidates(lastPowerDump?.uidPower.orEmpty()) }
-                .getOrElse { emptyList() }
+        val visuals = withContext(Dispatchers.IO) {
+            runCatching { packageVisuals.visualsFor(packageAggregates.keys.toList()) }
+                .getOrElse { emptyMap() }
         }
-        applyScenarioCandidates(candidates)
+        visualCache = visuals
+        rebuildScenariosIfChanged()
+        publish()
     }
 
     /**
-     * Converts real history points into chart segments. A gap larger than the missed-record
-     * threshold (the system logged nothing) becomes the dotted `MissedRecord*` variant; levels are
-     * never interpolated.
+     * History is read at start-up and hourly. When a package has samples but no interval yet, an
+     * extra (rate-limited) fetch happens so its row appears within a minute.
      */
-    private fun toChartSamples(
-        points: List<SystemBatteryStatsSource.HistoryPoint>,
-    ): List<ChartSample> {
-        if (points.isEmpty()) return emptyList()
-        val samples = ArrayList<ChartSample>(points.size)
-        var previousTimestamp = 0L
-        for (point in points) {
-            val missed = previousTimestamp > 0L &&
-                PowerMath.isMissedRecord(point.timestampMillis - previousTimestamp)
-            samples += ChartSample(
-                timestampMillis = point.timestampMillis,
-                levelPercent = point.levelPercent,
-                style = PowerMath.segmentStyle(point.screenOn, missed),
-            )
-            previousTimestamp = point.timestampMillis
-        }
-        return samples
+    private fun isHistoryDue(nowMillis: Long): Boolean {
+        if (lastHistoryFetchMillis == 0L) return true
+        if (nowMillis - lastHistoryFetchMillis >= HISTORY_REFRESH_INTERVAL_MILLIS) return true
+        val needsIntervals = unattributedSampleSeen ||
+            packageAggregates.keys.any { !foregroundIntervals.containsKey(it) }
+        return needsIntervals && nowMillis - lastHistoryFetchMillis >= MIN_HISTORY_RETRY_MILLIS
     }
 
-    /** Applies a fresh `dumpsys batterystats` result plus optional chart history. */
     private fun applyStats(
         powerDump: SystemBatteryStatsSource.PowerDump?,
         history: List<SystemBatteryStatsSource.HistoryPoint>,
         intervals: Map<String, List<TimeInterval>>?,
         fetchedAtMillis: Long,
     ) {
-        if (intervals != null) {
-            foregroundIntervals = intervals
-            foregroundIntervalsFetchedAtMillis = fetchedAtMillis
-        }
         if (powerDump != null) {
             powerDump.capacityMilliAmpHours?.let { designCapacityMilliAmpHours = it }
             powerDump.learnedCapacityMilliAmpHours?.let { learnedCapacityMilliAmpHours = it }
             lastPowerDump = powerDump
-            powerDump.timeOnBatteryMillis?.let {
-                systemTimeOnBatteryMillis = it
-                systemStatsFetchedAtMillis = fetchedAtMillis
-            }
         }
-
-        if (historySeedAllowed && history.size >= MIN_HISTORY_POINTS) {
+        if (intervals != null) {
+            foregroundIntervals = intervals
+            intervalsFetchedAtMillis = fetchedAtMillis
+            unattributedSampleSeen = false
+            rebuildIntervalIndex()
+        }
+        if (history.size >= MIN_HISTORY_POINTS) {
             historyChartSamples = toChartSamples(history)
         }
-    }
-
-    /** Builds the per-app list (labels/icons via `PackageManager`) and replaces it if it changed. */
-    private fun applyScenarioCandidates(candidates: List<ScenarioCandidate>) {
-        val visuals = runCatching {
-            packageVisuals.visualsFor(candidates.map { it.packageName })
-        }.getOrElse { emptyMap() }
-
-        scenarioCandidates = candidates
-        visualCache = visuals
-        val built = buildScenarios()
-        if (built != scenarios) scenarios = built
-        _state.update {
-            it.copy(scenarios = scenarios, loadingScenarios = false)
-        }
-    }
-
-    // =============================================================================================
-    // Usage scenarios
-    // =============================================================================================
-
-    /**
-     * `true` when a UID logged screen-foreground time but we have no interval for its package yet
-     * (the app was opened after the last history dump). Runs on `Dispatchers.IO`.
-     */
-    private fun hasForegroundWithoutIntervals(dump: SystemBatteryStatsSource.PowerDump): Boolean {
-        for (entry in dump.uidPower) {
-            if ((entry.foregroundMillis ?: 0L) <= 0L) continue
-            val packages = packageVisuals.packagesForUid(entry.uid)
-                .filter { packageVisuals.isReportablePackage(it) }
-            if (packages.isEmpty()) continue
-            if (packages.none { foregroundIntervals.containsKey(it) }) return true
-        }
-        return false
-    }
-
-    /**
-     * Foreground intervals for [packageName], with the still-open interval extended to "now".
-     *
-     * The history is only re-read every [HISTORY_REFRESH_INTERVAL_MILLIS], so the app that is
-     * currently on screen would otherwise stop collecting samples between two history fetches.
-     */
-    private fun foregroundIntervalsFor(packageName: String, nowMillis: Long): List<TimeInterval> {
-        val intervals = foregroundIntervals[packageName].orEmpty()
-        if (intervals.isEmpty()) return emptyList()
-        val fetchedAt = foregroundIntervalsFetchedAtMillis
-        val result = ArrayList<TimeInterval>(intervals.size)
-        for ((index, interval) in intervals.withIndex()) {
-            val isLast = index == intervals.lastIndex
-            val stillOpen = fetchedAt > 0L && interval.endMillis >= fetchedAt - OPEN_INTERVAL_SLACK_MILLIS
-            result += if (isLast && stillOpen) {
-                TimeInterval(interval.startMillis, maxOf(interval.endMillis, nowMillis))
-            } else {
-                interval
-            }
-        }
-        return result
-    }
-
-    /**
-     * Shizuku path: one candidate per UID from the batterystats dump.
-     *
-     * Energy comes from the UID's total mAh, duration from its foreground slices (`fg` + `fgs`,
-     * falling back to any recorded time), and the package name for the label/icon from
-     * `PackageManager`. Runs on `Dispatchers.IO`.
-     */
-    private fun resolveShizukuCandidates(
-        uidPower: List<SystemBatteryStatsSource.UidPower>,
-    ): List<ScenarioCandidate> {
-        val fallbackDuration = lastPowerDump?.timeOnBatteryMillis?.takeIf { it > 0L }
-            ?: sessionElapsedMillis()
-        // A UID without any recorded state time has no usable usage duration. Keep it only when it
-        // is a significant energy consumer; otherwise it would show up with a fabricated duration.
-        val significantMilliAmpHours = (lastPowerDump?.dischargeMilliAmpHours ?: 0f) *
-            MIN_UID_ENERGY_SHARE_OF_DISCHARGE
-        val byPackage = LinkedHashMap<String, ScenarioCandidate>()
-        val now = System.currentTimeMillis()
-
-        for (entry in uidPower) {
-            // System UIDs are shared between many packages: prefer a launchable one, but keep
-            // non-launchable system apps too (the reference screen lists 系统界面/系统桌面 etc.).
-            val packages = packageVisuals.packagesForUid(entry.uid)
-                .filter { packageVisuals.isReportablePackage(it) }
-            val packageName = packages.firstOrNull { packageVisuals.isLaunchableOrLauncher(it) }
-                ?: packages.firstOrNull()
-                ?: continue
-
-            val intervals = foregroundIntervalsFor(packageName, now)
-            val hadScreenForeground = (entry.foregroundMillis ?: 0L) > 0L || intervals.isNotEmpty()
-            // Background-service only rows (GMS, location/decision services…) carry a few µAh and no
-            // screen time; the reference never lists them and they would only add 0.01 W noise.
-            if (!hadScreenForeground) continue
-
-            val measuredDuration = entry.foregroundDurationMillis
-                .takeIf { it > 0L }
-                ?: entry.totalDurationMillis.takeIf { it > 0L }
-            if (measuredDuration == null && entry.milliAmpHours < significantMilliAmpHours) continue
-            val duration = measuredDuration ?: fallbackDuration
-            if (duration <= 0L) continue
-
-            val existing = byPackage[packageName]
-            if (existing == null || entry.milliAmpHours > (existing.uidMilliAmpHours ?: 0f)) {
-                byPackage[packageName] = ScenarioCandidate(
-                    packageName = packageName,
-                    foregroundMillis = duration,
-                    intervals = intervals,
-                    uidMilliAmpHours = entry.milliAmpHours,
-                    uidActiveMillis = measuredDuration,
-                    hadScreenForeground = true,
-                )
-            }
-        }
-
-        // Rank by watts; every app is kept (the card scrolls), nothing is truncated.
-        return byPackage.values.sortedByDescending { it.uidMilliAmpHours ?: 0f }
-    }
-
-    /**
-     * Per-app numbers for the "使用场景" card.
-     *
-     * Power: the system's per-UID mAh over the app's foreground time when available
-     * (`mAh / 1000 × V / h`), otherwise the samples that fall inside the app's foreground intervals
-     * (falling back to the session average). Temperature comes from the samples.
-     */
-    private fun buildScenarios(): List<UsageScenario> {
-        val candidates = scenarioCandidates
-        if (candidates.isEmpty()) return emptyList()
-
-        val samples = windowSamples.toList()
-        val sessionAveragePower = currentSessionAveragePower()
-        // Scene's definition for a row is "the device's average draw while that app was on screen".
-        // When our own samples do not cover the interval (it happened before this process started),
-        // the chart-window average is the closest whole-device number.
-        val windowAveragePower = PowerMath.timeWeightedMeanPower(samples)
-        val windowSpanMillis = if (samples.size >= 2) {
-            samples.last().timestampMillis - samples.first().timestampMillis
-        } else {
-            0L
-        }
-        val windowAverageReliable = samples.size >= MIN_SAMPLES_FOR_WINDOW_AVERAGE &&
-            windowSpanMillis >= MIN_SPAN_FOR_WINDOW_AVERAGE
-        val voltage = lastSnapshot?.voltageVolts
-            ?: lastBatteryDump?.voltageVolts
-            ?: DEFAULT_VOLTAGE_VOLTS
-        val (fallbackTemperature, fallbackMaxTemperature) = windowTemperatureStats(samples)
-        val summary = currentSummary()
-        val sessionDurationMillis = summary.usedMillis.takeIf { it > 0L }
-            ?: sessionElapsedMillis()
-        // Device draw when we have no sample inside the app's foreground interval (e.g. the app ran
-        // before this process started). The charge-cycle average is the best available proxy and
-        // keeps the list on the same scale as the summary.
-        val cycleAveragePower = summary.averagePowerWatts.takeIf { it > 0f }
-
-        val result = ArrayList<UsageScenario>(candidates.size)
-        for (candidate in candidates) {
-            val visual = visualCache[candidate.packageName] ?: continue
-            val metrics = PowerMath.metricsForIntervals(samples, candidate.intervals, sessionAveragePower)
-            val durationMillis = candidate.foregroundMillis.takeIf { it > 0L }
-                ?: candidate.uidActiveMillis?.takeIf { it > 0L }
-                ?: sessionDurationMillis
-            val uidPowerWatts = powerFromUidMilliAmpHours(
-                milliAmpHours = candidate.uidMilliAmpHours,
-                activeMillis = candidate.uidActiveMillis,
-                sessionMillis = sessionDurationMillis,
-                voltageVolts = voltage,
-            )
-            // Precedence: our own samples inside the foreground interval (exactly what Scene
-            // shows) → whole-device chart-window average when the interval predates our samples →
-            // the cycle average → UID mAh share (only when there is no foreground interval at all).
-            val perAppPowerWatts = metrics?.weightedPowerWatts
-                ?: if (candidate.intervals.isNotEmpty()) {
-                    val deviceAverage = if (windowAverageReliable) {
-                        windowAveragePower.takeIf { it > 0f } ?: cycleAveragePower
-                    } else {
-                        cycleAveragePower
-                    }
-                    deviceAverage ?: uidPowerWatts ?: sessionAveragePower
-                } else {
-                    uidPowerWatts ?: sessionAveragePower
-                }
-            result += UsageScenario(
-                packageName = candidate.packageName,
-                label = visual.label,
-                icon = visual.icon,
-                durationMillis = durationMillis,
-                averagePowerWatts = perAppPowerWatts,
-                averageTemperatureCelsius = metrics?.averageTemperatureCelsius ?: fallbackTemperature,
-                maxTemperatureCelsius = metrics?.maxTemperatureCelsius ?: fallbackMaxTemperature,
-            )
-        }
-        // The card always sorts by watts; doing it here keeps the state itself consistent.
-        return result.sortedByDescending { it.averagePowerWatts }
-    }
-
-    /**
-     * `mAh / 1000 × V / hours` — the system's own energy accounting turned into an average draw.
-     *
-     * The UID figure is app-attributed energy only (batterystats accounts screen/radio separately),
-     * so the floor is [PowerMath.MIN_APP_POWER_WATTS] rather than the device-wide 0.05 W.
-     */
-    private fun powerFromUidMilliAmpHours(
-        milliAmpHours: Float?,
-        activeMillis: Long?,
-        sessionMillis: Long,
-        voltageVolts: Float,
-    ): Float? {
-        if (milliAmpHours == null || milliAmpHours <= 0f) return null
-        val active = activeMillis?.takeIf { it > 0L }
-            ?: sessionMillis.takeIf { it > 0L }
-            ?: return null
-        val hours = active / 3_600_000f
-        if (hours <= 0f) return null
-        return PowerMath.clampAppPower(milliAmpHours / 1000f * voltageVolts / hours)
-    }
-
-    /** Mean / max battery temperature over the samples currently in the chart window. */
-    private fun windowTemperatureStats(samples: List<PowerSample>): Pair<Float, Float> {
-        if (samples.isEmpty()) {
-            val fallback = lastSnapshot?.temperatureCelsius ?: 0f
-            return fallback to fallback
-        }
-        var sum = 0f
-        var max = Float.NEGATIVE_INFINITY
-        for (sample in samples) {
-            sum += sample.temperatureCelsius
-            if (sample.temperatureCelsius > max) max = sample.temperatureCelsius
-        }
-        return (sum / samples.size) to max
-    }
-
-    /** Wall-clock time since monitoring started, independent of the summary's data source. */
-    private fun sessionElapsedMillis(): Long {
-        val start = sessionStartMillis ?: return 0L
-        return (System.currentTimeMillis() - start).coerceAtLeast(0L)
     }
 
     // =============================================================================================
@@ -1085,49 +923,85 @@ class PowerStatsRepository(context: Context) {
     // =============================================================================================
 
     private fun beginSession(levelPercent: Int?) {
-        val now = System.currentTimeMillis()
-        sessionStartMillis = now
+        resetSessionState(System.currentTimeMillis(), levelPercent, allowHistorySeed = windowSamples.isEmpty())
+        persistSession()
+    }
+
+    private fun resetSessionState(nowMillis: Long, levelPercent: Int?, allowHistorySeed: Boolean) {
+        sessionStartMillis = nowMillis
         startLevelPercent = levelPercent
+        sessionSampleCount = 0
+        sessionPowerMilliWattSum = 0.0
+        packageAggregates.clear()
         windowSamples.clear()
         chartSamples = emptyList()
-        weightedPowerSum = 0.0
-        weightSum = 0.0
-        lastAccumulatorAtMillis = now
-        lastTickAtMillis = now
-        energyAnchorWattHours = null
-        energyAnchorMillis = 0L
-        counterAnchorMicroAmpHours = null
-        counterAnchorMillis = 0L
+        historyChartSamples = emptyList()
+        historySeedAllowed = allowHistorySeed
+        lastChartPointAtMillis = 0L
+        lastSampleAtMillis = 0L
+        lastSampleLevel = -1
+        lastSampleWasScreenOn = false
+        lastSamplesPersistedAtMillis = 0L
+    }
 
-        store.clearSession()
-        store.saveSessionStartMillis(now)
-        store.saveStartLevelPercent(levelPercent)
+    private fun archiveCurrentSession(nowMillis: Long, endLevelPercent: Int?) {
+        val start = sessionStartMillis ?: return
+        if (sessionSampleCount <= 0) return
+        val averagePowerWatts = (-sessionPowerMilliWattSum / sessionSampleCount / 1000.0).toFloat()
+        val durationMillis = sessionSampleCount.toLong() * PowerMath.TICK_INTERVAL_MILLIS
+        val record = SessionRecord(
+            startedAtMillis = start,
+            durationMillis = durationMillis,
+            averagePowerWatts = averagePowerWatts.coerceAtLeast(0f),
+            energyWattHours = averagePowerWatts.coerceAtLeast(0f) * durationMillis / 3_600_000f,
+            startLevelPercent = startLevelPercent ?: endLevelPercent ?: 100,
+            endLevelPercent = endLevelPercent ?: startLevelPercent ?: 100,
+        )
+        sessionHistory = (listOf(record) + sessionHistory).take(MAX_SESSION_HISTORY)
+        store.saveHistory(sessionHistory)
     }
 
     private fun restoreSession() {
-        val storedStart = store.loadSessionStartMillis() ?: return
-        sessionStartMillis = storedStart
-        startLevelPercent = store.loadStartLevelPercent()
-
-        val (storedWeightedPower, storedWeight) = store.loadAccumulators()
-        weightedPowerSum = storedWeightedPower
-        weightSum = storedWeight
+        val stored = store.loadSession() ?: return
+        sessionStartMillis = stored.startMillis
+        startLevelPercent = stored.startLevelPercent
+        sessionSampleCount = stored.sampleCount
+        sessionPowerMilliWattSum = stored.powerMilliWattSum
+        packageAggregates.putAll(stored.packages)
+        lastSampleAtMillis = stored.lastSampleAtMillis
+        lastSampleLevel = stored.lastSampleLevel
 
         val threshold = System.currentTimeMillis() - PowerMath.CHART_WINDOW_MILLIS
         for (sample in store.loadSamples()) {
             if (sample.timestampMillis >= threshold) windowSamples.add(sample)
         }
-
+        lastChartPointAtMillis = windowSamples.lastOrNull()?.timestampMillis ?: 0L
         rebuildChartSamples()
-        lastAccumulatorAtMillis = System.currentTimeMillis()
+        historySeedAllowed = windowSamples.isEmpty()
     }
 
     private fun persistSession() {
-        store.saveSessionStartMillis(sessionStartMillis)
-        store.saveStartLevelPercent(startLevelPercent)
-        store.saveAccumulators(weightedPowerSum, weightSum)
+        store.saveSession(
+            sessionStartMillis?.let { start ->
+                StoredSession(
+                    startMillis = start,
+                    startLevelPercent = startLevelPercent,
+                    sampleCount = sessionSampleCount,
+                    powerMilliWattSum = sessionPowerMilliWattSum,
+                    lastSampleAtMillis = lastSampleAtMillis,
+                    lastSampleLevel = lastSampleLevel,
+                    packages = packageAggregates,
+                )
+            },
+        )
         store.saveSamples(windowSamples)
         store.saveHistory(sessionHistory)
+    }
+
+    private fun persistSessionIfDue(nowMillis: Long) {
+        if (nowMillis - lastSamplesPersistedAtMillis < SESSION_PERSIST_INTERVAL_MILLIS) return
+        lastSamplesPersistedAtMillis = nowMillis
+        persistSession()
     }
 
     // =============================================================================================
@@ -1149,111 +1023,9 @@ class PowerStatsRepository(context: Context) {
                 fullCapacityWattHours = fullCapacityWattHours(),
                 shizukuGranted = shizukuGranted,
                 shizukuAvailable = shizukuAvailable,
+                rootAvailable = rootAvailable,
             )
         }
-    }
-
-    /**
-     * History first, then the live samples for the most recent minutes. Deduplicated because the
-     * history keeps covering the same wall-clock minutes while the app is running.
-     */
-    private fun mergedChartSamples(): List<ChartSample> {
-        val live = chartSamples
-        val history = historyChartSamples
-        if (history.isEmpty()) return live
-        if (live.isEmpty()) return history
-        val firstLiveTimestamp = live.first().timestampMillis
-        val merged = ArrayList<ChartSample>(history.size + live.size)
-        for (sample in history) {
-            if (sample.timestampMillis < firstLiveTimestamp) merged += sample
-        }
-        merged += live
-        return merged
-    }
-
-    /**
-     * Summary for the three columns, recomputed on every tick.
-     *
-     * The numbers are the system's own charge-cycle accounting: `Discharge mAh → W` over
-     * `Time on battery`, with the used time extrapolated between stats fetches so it keeps moving.
-     * Without the Shizuku permission (or before the first dump) there is nothing honest to show,
-     * so the summary stays zeroed instead of being estimated.
-     */
-    private fun currentSummary(): PowerSummary {
-        if (!shizukuGranted) return PowerSummary(0f, 0L, 0L)
-        val now = System.currentTimeMillis()
-        val usedMillis = systemUsedMillis(now) ?: return PowerSummary(0f, 0L, 0L)
-        val averagePowerWatts = smoothedSystemAverageWatts ?: return PowerSummary(0f, usedMillis, 0L)
-
-        val remainingWattHours = lastSnapshot?.remainingEnergyWattHours
-        // Deliberately *not* the 72 h-clamped estimate: with a correct average this lands around a
-        // day, and a broken average must be visible rather than masked.
-        val runtimeMillis = if (remainingWattHours != null && remainingWattHours > 0f) {
-            (remainingWattHours / averagePowerWatts * 3_600_000f).toLong().coerceAtLeast(0L)
-        } else {
-            0L
-        }
-        return PowerSummary(
-            averagePowerWatts = averagePowerWatts,
-            usedMillis = usedMillis,
-            estimatedRuntimeMillis = runtimeMillis,
-        )
-    }
-
-    /**
-     * Full-pack capacity in Wh, as shown by the "使用过程" card (`29.0Wh` on this phone).
-     *
-     * `7500 mAh (learned, health-adjusted) × 3.87 V ≈ 29.0 Wh`, computed **once** from the first
-     * successful dump: it is a hardware property, not a live value. Without the Shizuku dump the
-     * value is unknown (`null` → the card shows `--`).
-     */
-    private fun fullCapacityWattHours(): Float? {
-        fullCapacityWattHoursCache?.let { return it }
-        val capacityMilliAmpHours = learnedCapacityMilliAmpHours
-            ?: designCapacityMilliAmpHours
-            ?: return null
-        if (capacityMilliAmpHours <= 0) return null
-        val wattHours = capacityMilliAmpHours / 1000f * NOMINAL_VOLTAGE_VOLTS
-        fullCapacityWattHoursCache = wattHours
-        return wattHours
-    }
-
-    /** `Time on battery` from the last dump plus the wall-clock drift since that dump. */
-    private fun systemUsedMillis(nowMillis: Long): Long? {
-        val base = systemTimeOnBatteryMillis.takeIf { it > 0L } ?: return null
-        val drift = (nowMillis - systemStatsFetchedAtMillis).coerceIn(0L, SYSTEM_TIME_DRIFT_CAP_MILLIS)
-        return base + drift
-    }
-
-    /** Smooths the charge-cycle average so counter steps do not make the numbers flicker. */
-    private fun updateSystemAverageSmoothing(nowMillis: Long) {
-        if (!shizukuGranted) {
-            smoothedSystemAverageWatts = null
-            return
-        }
-        val dump = lastPowerDump
-        val discharge = dump?.dischargeMilliAmpHours?.takeIf { it >= MIN_DISCHARGE_FOR_AVERAGE }
-        val usedMillis = systemUsedMillis(nowMillis)
-        if (dump == null || discharge == null || usedMillis == null) return
-        if (usedMillis < MIN_TIME_ON_BATTERY_FOR_AVERAGE) return
-
-        val voltage = lastSnapshot?.voltageVolts
-            ?: lastBatteryDump?.voltageVolts
-            ?: DEFAULT_VOLTAGE_VOLTS
-        val hours = usedMillis / 3_600_000f
-        if (hours <= 0f) return
-        val raw = PowerMath.clampPower(discharge / 1000f * voltage / hours)
-        smoothedSystemAverageWatts = smoothedSystemAverageWatts
-            ?.let { it + (raw - it) * SYSTEM_AVERAGE_SMOOTHING }
-            ?: raw
-    }
-
-    /** Time-weighted mean draw over the whole session; 0 until at least one tick was accumulated. */
-    private fun currentSessionAveragePower(): Float {
-        if (weightSum <= 0.0) return 0f
-        return (weightedPowerSum / weightSum).toFloat()
-            .coerceIn(0f, PowerMath.MAX_POWER_WATTS)
-            .takeIf { it.isFinite() } ?: 0f
     }
 
     // =============================================================================================
@@ -1289,95 +1061,57 @@ class PowerStatsRepository(context: Context) {
         receiverRegistered = false
     }
 
+    private data class IntervalEntry(
+        val startMillis: Long,
+        val endMillis: Long,
+        val packageName: String,
+    )
+
     private companion object {
-        /**
-         * `dumpsys batterystats --charged` cadence. The state tick is 3 s; the aggregate dump takes
-         * 1–2 s, so it runs every second tick (6 s) to keep the shell load in check. The UI still
-         * updates every 3 s from the cached aggregate.
-         */
+        /** `dumpsys batterystats --charged` cadence; the 3 s tick re-emits cached values in between. */
         const val MIN_STATS_REFRESH_INTERVAL_MILLIS = 6_000L
 
-        /** `--history` (chart seed + foreground intervals) cadence: start-up, then hourly. */
+        /** `--history` (foreground intervals + chart seed) cadence. */
         const val HISTORY_REFRESH_INTERVAL_MILLIS = 60L * 60_000L
 
-        /** Extra history fetch when a new app came to the foreground (rate limit). */
+        /** Extra history fetch when a sampled package has no interval yet (rate limit). */
         const val MIN_HISTORY_RETRY_MILLIS = 60_000L
-
-        /** An interval that ends this close to the history fetch was still open. */
-        const val OPEN_INTERVAL_SLACK_MILLIS = 15_000L
-
-        /** The chart-window average is only trusted for the per-app fallback past these bounds. */
-        const val MIN_SAMPLES_FOR_WINDOW_AVERAGE = 3
-        const val MIN_SPAN_FOR_WINDOW_AVERAGE = 60_000L
-
-        /** Li-ion nominal voltage used for the pack capacity (`7500 mAh × 3.87 V ≈ 29.0 Wh`). */
-        const val NOMINAL_VOLTAGE_VOLTS = 3.87f
-
-        /** SharedPreferences is written at this rate, not on every tick. */
-        const val SAMPLE_PERSIST_INTERVAL_MILLIS = 60_000L
-
-        /** Values from a `dumpsys battery` older than this are replaced by the SDK reading. */
-        const val SHIZUKU_DUMP_FRESH_MILLIS = 8_000L
-
-        /** Minimum window between two battery dumps before the counter delta is trusted. */
-        const val MIN_COUNTER_POWER_WINDOW_MILLIS = 5_000L
-
-        /** Periodic usage-access / Shizuku re-check (once per 3 s tick). */
-        const val PERMISSION_CHECK_INTERVAL_MILLIS = 3_000L
-
-        /** How far `Time on battery` may be extrapolated past the last stats fetch. */
-        const val SYSTEM_TIME_DRIFT_CAP_MILLIS = 10_000L
-
-        /** Low-pass factor for the charge-cycle average (steps in the mAh counter). */
-        const val SYSTEM_AVERAGE_SMOOTHING = 0.25f
-
-        /** Below these, the charge-cycle averages are reset/noise and must not be shown. */
-        const val MIN_DISCHARGE_FOR_AVERAGE = 0.2f
-        const val MIN_TIME_ON_BATTERY_FOR_AVERAGE = 20_000L
 
         /** A `--history` stamp a few seconds ahead of `now` is normal (clock skew). */
         const val HISTORY_CLOCK_SKEW_MILLIS = 5_000L
 
+        /** An interval that ends this close to the history fetch was still open. */
+        const val OPEN_INTERVAL_SLACK_MILLIS = 15_000L
+
+        /** Attribute a sample to the last foreground app if it left at most this long ago. */
+        const val PACKAGE_FALLBACK_WINDOW_MILLIS = 30_000L
+
         /** Fewer reconstructed points than this means the history was missing/rotated away. */
         const val MIN_HISTORY_POINTS = 2
+
+        /** Session persistence cadence. */
+        const val SESSION_PERSIST_INTERVAL_MILLIS = 60_000L
+
+        /** Periods that make Scene start a new session. */
+        const val SESSION_MAX_GAP_MILLIS = 24L * 60L * 60_000L
+        const val SESSION_LEVEL_RISE_GAP_MILLIS = 30_000L
+
+        /** Minimum window for the charge-counter reference power (current calibration). */
+        const val MIN_COUNTER_WINDOW_MILLIS = 5_000L
+
+        /** A counter reference older than this is stale and no longer used for calibration. */
+        const val COUNTER_REFERENCE_VALIDITY_MILLIS = 120_000L
+
+        /** Periodic Shizuku re-check (once per tick at 3 s). */
+        const val PERMISSION_CHECK_INTERVAL_MILLIS = 3_000L
 
         /** Give `dumpsys batterystats --reset` a moment before reading the counters back. */
         const val SCENARIO_REFRESH_AFTER_RESET_MILLIS = 800L
 
-        /** A UID without recorded state time must at least carry this share of the cycle drain. */
-        const val MIN_UID_ENERGY_SHARE_OF_DISCHARGE = 0.01f
-
-        /** Fuel-gauge anchor: window and resolution needed for a meaningful ΔWh (1 mAh steps). */
-        const val MIN_FUEL_GAUGE_WINDOW_MILLIS = 20_000L
-        const val MIN_FUEL_GAUGE_STEP_WATT_HOURS = 0.002f
-
-        /** Level-only fallback: 1 % of a 7.5 Ah pack is too coarse for a short window. */
-        const val MIN_LEVEL_WINDOW_MILLIS = 10L * 60_000L
-        const val MIN_LEVEL_STEP_WATT_HOURS = 0.2f
-
-        /** Finished sessions kept by "清理数据". */
+        /** Finished sessions kept by "清理数据" / automatic session resets. */
         const val MAX_SESSION_HISTORY = 20
 
-        /** Hard cap on chart points (the 45 min window normally holds a few hundred). */
-        const val MAX_CHART_SAMPLES = 600
-
-        const val DEFAULT_VOLTAGE_VOLTS = 4.2f
-        const val DEFAULT_LEVEL_PERCENT = 100
-        const val MILLIS_PER_HOUR = 3_600_000f
+        /** Hard cap on chart points (the 45 min window holds ≤ 900 at 3 s). */
+        const val MAX_CHART_SAMPLES = 1_000
     }
 }
-
-/**
- * One row of the "使用场景" list before it becomes a [UsageScenario]: the system's per-UID energy
- * accounting (`uidMilliAmpHours`) plus the foreground intervals reconstructed from the batterystats
- * history, which drive the whole-device power attribution and the temperatures.
- */
-private data class ScenarioCandidate(
-    val packageName: String,
-    val foregroundMillis: Long,
-    val intervals: List<TimeInterval>,
-    val uidMilliAmpHours: Float?,
-    val uidActiveMillis: Long?,
-    /** `true` when the app actually had screen time; background-service-only rows are noise. */
-    val hadScreenForeground: Boolean,
-)
