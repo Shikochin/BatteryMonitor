@@ -56,14 +56,38 @@
 
 ## 构建
 
-```bash
-./gradlew :app:assembleDebug
-# 产物：app/build/outputs/apk/debug/app-debug.apk
+版本号：`versionName` 固定 `1.0`，`versionCode` 用 **git commit 数**，不用手改：
 
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+| 字段 | 取值 |
+| --- | --- |
+| `versionName` | 固定 `1.0` |
+| `versionCode` | `git rev-list --count HEAD`（每次提交 +1，`adb install -r` 直接覆盖升级） |
+
+`versionCode` 可用 `-PversionCode=123`（或环境变量 `VERSION_CODE`）临时覆盖；
+不在 git 仓库里（比如源码压缩包）时回落到 `1`。
+
+```bash
+./gradlew -q :app:printVersion      # 看当前推导出的版本，例如 versionCode=4 / versionName=1.0
+./gradlew :app:assembleRelease
+# 产物：app/build/outputs/apk/release/app-release.apk
+
+adb install -r app/build/outputs/apk/release/app-release.apk
 ```
 
+- **只打 arm64-v8a**（`ndk.abiFilters`），单 APK 约 8 MB。
+- release 用 **debug 签名**（`signingConfig = signingConfigs.getByName("debug")`），只为侧载，不上架。
+
 环境：JDK 17+（本机 Gradle 9.6 / JDK 25 可直接构建），Android SDK 37，minSdk 29。
+
+## CI（GitHub Actions）
+
+`.github/workflows/android.yml`：push 到 `main`、PR、手动触发都会构建一个 release APK（arm64-v8a、debug 签名），
+版本号规则与本地一致，产物按 `BatteryMonitor-1.0-build<commit 数>-arm64-v8a.apk` 上传到 Actions Artifacts；
+打 `v*` tag 时还会附到 GitHub Release。构建前会校验 APK 的 `versionCode`、ABI 和签名。
+
+- `checkout` 必须 `fetch-depth: 0`，浅克隆算出来的 commit 数是 1。
+- workflow 缓存 `~/.android/debug.keystore`，让不同次 CI 构建的签名保持一致、可以互相覆盖安装；
+  它和本机 debug 签名的包互不兼容，跨来源安装要先卸载。
 
 ## 技术栈
 
