@@ -4,6 +4,14 @@
 
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackagesPermission" />
 
+    <!--
+      miuix-blur declares minSdk 33 because every one of its effects is built on RuntimeShader.
+      This app keeps minSdk 29 and gates every blur call behind isRuntimeShaderSupported(), so the
+      library is only ever *executed* on Android 13+; below that the top bar falls back to an
+      opaque surface colour. The override exists purely to satisfy the manifest merger.
+    -->
+    <uses-sdk tools:overrideLibrary="top.yukonga.miuix.kmp.blur" />
+
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"

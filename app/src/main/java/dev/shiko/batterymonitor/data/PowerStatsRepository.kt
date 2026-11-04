@@ -144,6 +144,7 @@ class PowerStatsRepository(context: Context) {
     private var tickJob: Job? = null
     private var batteryJob: Job? = null
     private var statsJob: Job? = null
+    private var visualsJob: Job? = null
 
     private val batteryReceiver = object : BroadcastReceiver() {
         override fun onReceive(receiverContext: Context?, intent: Intent?) {
@@ -379,6 +380,10 @@ class PowerStatsRepository(context: Context) {
         val now = System.currentTimeMillis()
         maybeRefreshShizukuState(now)
         requestBatteryReading()
+        // The scenario list is pure aggregation over the in-memory session samples, so it is
+        // recomputed on every tick (3 s) like the rest of the screen — no extra shell traffic.
+        ensureVisualsForAggregates()
+        rebuildScenariosIfChanged()
         publish()
     }
 
@@ -608,6 +613,8 @@ class PowerStatsRepository(context: Context) {
         )
         latestPowerWatts = powerWatts
         handleSampling(reading, screenOn, now)
+        ensureVisualsForAggregates()
+        rebuildScenariosIfChanged()
         publish()
     }
 
@@ -832,6 +839,27 @@ class PowerStatsRepository(context: Context) {
     // =============================================================================================
 
     /**
+     * Loads label/icon for packages that just appeared in the aggregates.
+     *
+     * Icons are cached inside [PackageVisuals], so this only touches `PackageManager` once per new
+     * package — never once per tick, which would thrash the GC.
+     */
+    private fun ensureVisualsForAggregates() {
+        val missing = packageAggregates.keys.filterNot(visualCache::containsKey)
+        if (missing.isEmpty()) return
+        if (visualsJob?.isActive == true) return
+        visualsJob = scope.launch {
+            val loaded = withContext(Dispatchers.IO) {
+                runCatching { packageVisuals.visualsFor(missing) }.getOrElse { emptyMap() }
+            }
+            if (loaded.isEmpty()) return@launch
+            visualCache = visualCache + loaded
+            rebuildScenariosIfChanged()
+            publish()
+        }
+    }
+
+    /**
      * Foreground package at [timestampMillis] according to the batterystats history intervals.
      *
      * The history is a dump: when the user switches apps between two fetches, the new interval does
@@ -959,11 +987,7 @@ class PowerStatsRepository(context: Context) {
             if (historyDue) lastHistoryFetchMillis = fetchedAt
         }
 
-        val visuals = withContext(Dispatchers.IO) {
-            runCatching { packageVisuals.visualsFor(packageAggregates.keys.toList()) }
-                .getOrElse { emptyMap() }
-        }
-        visualCache = visuals
+        ensureVisualsForAggregates()
         rebuildScenariosIfChanged()
         publish()
     }
