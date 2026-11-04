@@ -68,7 +68,7 @@ android {
 
     androidResources {
         // Only the languages the UI actually ships: AndroidX otherwise contributes ~80 locales.
-        localeFilters += listOf("zh", "zh-rTW", "en", "ja")
+        localeFilters += listOf("zh", "zh-rTW", "ja")
     }
 
     packaging {

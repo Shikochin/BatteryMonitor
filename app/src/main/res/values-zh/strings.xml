@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">耗电统计</string>
+
+    <!-- 顶栏与操作 -->
+    <string name="screen_title">耗电统计</string>
+    <string name="action_history">历史记录</string>
+    <string name="action_clear_data">清除数据</string>
+    <string name="action_help">说明提示</string>
+    <string name="action_close">关闭</string>
+
+    <!-- 下拉刷新 -->
+    <string name="pull_to_refresh">下拉刷新</string>
+    <string name="release_to_refresh">松开刷新</string>
+    <string name="refreshing">正在刷新…</string>
+    <string name="refresh_done">刷新完成</string>
+
+    <!-- 清除确认 -->
+    <string name="clear_confirm_title">清除本次统计？</string>
+    <string name="action_cancel">取消</string>
+    <string name="action_confirm">确定</string>
+
+    <!-- 数据来源 -->
+    <string name="data_source_root">Shizuku (root)</string>
+    <string name="data_source_shell">Shizuku (shell)</string>
+    <string name="data_source_unauthorized">Shizuku (未授权)</string>
+    <string name="data_source_disconnected">Shizuku (未连接)</string>
+    <string name="daemon_running">运行中</string>
+    <string name="daemon_stopped">未运行</string>
+    <string name="data_source_line">数据来源：%1$s · 守护进程%2$s</string>
+
+    <!-- 卡片标题 -->
+    <string name="card_usage_process">使用过程</string>
+    <string name="card_usage_scenarios">使用场景</string>
+
+    <!-- 汇总 -->
+    <string name="summary_average_power">平均功耗</string>
+    <string name="summary_used">已使用</string>
+    <string name="summary_estimated_runtime">理论续航</string>
+
+    <!-- 图例 -->
+    <string name="legend_title">说明提示</string>
+    <string name="legend_screen_on">屏幕点亮</string>
+    <string name="legend_screen_off">屏幕关闭</string>
+    <string name="legend_missed_screen_on">屏幕点亮，未记录电池状态</string>
+    <string name="legend_missed_screen_off">屏幕关闭，未记录电池状态</string>
+    <string name="legend_hint_screen_off">在手机屏幕关闭时，本应用会停止记录电池状态以减少耗电，在图表中显示为灰色虚线。</string>
+    <string name="legend_hint_missed">但如果图表中出现蓝色虚线，说明后台进程被休眠，未能按计划的频率记录电池状态。</string>
+    <string name="legend_got_it">我知道了</string>
+
+    <!-- 历史记录 -->
+    <string name="history_title">历史记录</string>
+    <string name="history_empty">暂无历史记录</string>
+    <string name="history_clear">清空历史记录</string>
+    <string name="history_delete">删除这条记录</string>
+
+    <!-- 使用场景 -->
+    <string name="scenario_toggle_unit_w">切换为 W 单位</string>
+    <string name="scenario_toggle_unit_ma">切换为 mA 单位</string>
+    <string name="scenario_sort_desc">当前按功耗从高到低，点击改为从低到高</string>
+    <string name="scenario_sort_asc">当前按功耗从低到高，点击改为从高到低</string>
+    <string name="scenario_permission_required">需要 Shizuku 权限才能统计应用耗电</string>
+    <string name="scenario_grant">去授权</string>
+    <string name="scenario_loading">正在统计…</string>
+    <string name="scenario_empty">最近 45 分钟内没有应用使用记录</string>
+</resources>
