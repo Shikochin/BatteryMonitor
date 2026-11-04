@@ -58,10 +58,35 @@ android {
             // Signed with the debug key on purpose: the release build is for
             // sideloading (R8-optimised), not for Play distribution.
             signingConfig = signingConfigs.getByName("debug")
+            // `packageScope` defaults to "**" (opt everything); narrowing it keeps every other
+            // package untouched and costs ~6 MB of dex, so we deliberately leave it at the default.
             optimization {
                 enable = true
-                packageScope = setOf("androidx.**", "kotlin.**", "kotlinx.**")
             }
+        }
+    }
+
+    androidResources {
+        // Only the languages the UI actually ships: AndroidX otherwise contributes ~80 locales.
+        localeFilters += listOf("zh", "en")
+    }
+
+    packaging {
+        resources {
+            // Build metadata and licence files are not needed at runtime.
+            excludes += setOf(
+                "META-INF/*.version",
+                "META-INF/LICENSE*",
+                "META-INF/NOTICE*",
+                "META-INF/AL2.0",
+                "META-INF/LGPL2.1",
+                "META-INF/DEPENDENCIES",
+                "META-INF/**/LICENSE*",
+                "META-INF/version-control-info.textproto",
+                "DebugProbesKt.bin",
+                // Kotlin builtin reflection metadata: the app does not reflect on builtin types.
+                "kotlin/**/*.kotlin_builtins",
+            )
         }
     }
     compileOptions {
@@ -97,7 +122,7 @@ dependencies {
     implementation(libs.androidx.ui)
     implementation(libs.androidx.ui.graphics)
     implementation(libs.androidx.foundation)
-    implementation(libs.androidx.ui.tooling.preview)
+    debugImplementation(libs.androidx.ui.tooling.preview)
 
     implementation(libs.miuix)
     implementation(libs.miuix.icons)

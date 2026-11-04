@@ -77,10 +77,23 @@
 adb install -r app/build/outputs/apk/release/app-release.apk
 ```
 
-- **只打 arm64-v8a**（`ndk.abiFilters`），单 APK 约 8 MB。
+- **只打 arm64-v8a**（`ndk.abiFilters`），release APK 约 **2.3 MB**。
 - release 用 **debug 签名**（`signingConfig = signingConfigs.getByName("debug")`），只为侧载，不上架。
 
 环境：JDK 17+（本机 Gradle 9.6 / JDK 25 可直接构建），Android SDK 37，minSdk 29。
+
+### 包体积
+
+| 手段 | 效果 |
+| --- | --- |
+| release 开 R8（`optimization.enable = true`），且**不限制 `packageScope`**（默认 `**`） | **8.5 MB → 2.35 MB**，最关键 |
+| `androidResources.localeFilters = ["zh", "en"]`（原来 AndroidX 带上百种语言） | −60 KB |
+| `packaging.resources.excludes`：META-INF 的许可/`.version` 文件、`DebugProbesKt.bin`、Kotlin builtin 反射元数据 | −23 KB |
+| `ui-tooling-preview` 改成 `debugImplementation` | 不进 release |
+| 只保留 arm64-v8a | 单 ABI 单包 |
+
+> `optimization.packageScope` 一旦写窄（比如只写 `androidx.**`、`kotlin.**`），其他包就完全不参与
+> R8 的裁剪/混淆，dex 会从 2.1 MB 涨回 8 MB；保持默认 `**` 才能拿到完整优化。
 
 ## CI（GitHub Actions）
 
