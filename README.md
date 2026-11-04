@@ -1,5 +1,7 @@
 # 耗电统计 · Battery Monitor
 
+> AI SLOP WARNING.
+
 把 Scene 的「耗电统计」页面单独拆出来做成的独立 App，界面用 **Jetpack Compose + [Miuix](https://github.com/compose-miuix-ui/miuix)**（HyperOS 风格设计系统）重新实现。
 
 参考设计里底部的「在寻找其它功能吗?」一栏按需求**不做**。
