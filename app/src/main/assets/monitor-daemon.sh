@@ -33,7 +33,7 @@ esac
 # Bump whenever this file changes: the app compares it with the version published in STATE and
 # replaces a daemon left over from an older build (otherwise an app update would keep sampling
 # with the old script until the next reboot).
-VERSION=2
+VERSION=3
 
 # True when $1 is a live sampler. `sh -c` wrappers are excluded because their
 # command text contains this script's name and they must never be killed.
@@ -216,7 +216,12 @@ while :; do
   fi
 
   write_state "$now"
-  sleep "$interval"
+  # Keep the sampling cadence independent of the time spent reading sysfs and running dumpsys.
+  # Sleeping a full interval after collection makes every sample late by the command duration,
+  # which accumulates into a visible drift on the chart.
+  finished=$(date +%s)
+  sleep_for=$((interval - finished + now))
+  [ "$sleep_for" -gt 0 ] && sleep "$sleep_for"
 
   count=$((count + 1))
   if [ "$count" -ge "$ROTATE_EVERY" ]; then
