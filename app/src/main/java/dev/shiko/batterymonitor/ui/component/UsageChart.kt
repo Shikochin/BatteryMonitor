@@ -70,7 +70,9 @@ fun UsageChart(
 ) {
     val colors = MiuixTheme.colorScheme
     val screenOnColor = colors.primary
-    val screenOffColor = colors.onSurfaceVariantActions
+    // Use the exact RGB inverse of the active blue so screen-on and screen-off remain distinct
+    // even when Monet changes the accent palette.
+    val screenOffColor = colors.primary.inverted()
     val gridColor = colors.dividerLine
     val labelColor = colors.onSurfaceVariantSummary
 
@@ -463,6 +465,13 @@ private fun ChartSegmentStyle.isScreenOff(): Boolean = when (this) {
 }
 
 private const val ChartTickMillis = 3_000L
+
+internal fun Color.inverted(): Color = Color(
+    red = 1f - red,
+    green = 1f - green,
+    blue = 1f - blue,
+    alpha = alpha,
+)
 
 /** Picks the axis span for the recorded session, mirroring Scene's `d(double)`. */
 private fun axisSpan(samples: List<ChartSample>): AxisSpan {

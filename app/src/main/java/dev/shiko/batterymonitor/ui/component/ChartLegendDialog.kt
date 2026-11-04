@@ -54,9 +54,9 @@ fun ChartLegendDialog(
     ) {
         Column(modifier = Modifier.fillMaxWidth()) {
             LegendRow(color = colors.primary, dotted = false, label = stringResource(R.string.legend_screen_on))
-            LegendRow(color = colors.onSurfaceVariantActions, dotted = false, label = stringResource(R.string.legend_screen_off))
+            LegendRow(color = colors.primary.inverted(), dotted = false, label = stringResource(R.string.legend_screen_off))
             LegendRow(color = colors.primary, dotted = true, label = stringResource(R.string.legend_missed_screen_on))
-            LegendRow(color = colors.onSurfaceVariantActions, dotted = true, label = stringResource(R.string.legend_missed_screen_off))
+            LegendRow(color = colors.primary.inverted(), dotted = true, label = stringResource(R.string.legend_missed_screen_off))
 
             Spacer(Modifier.height(16.dp))
             HintParagraph(stringResource(R.string.legend_hint_screen_off))
