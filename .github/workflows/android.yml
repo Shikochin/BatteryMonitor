@@ -34,26 +34,41 @@ jobs:
           fetch-depth: 0
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
 
+      # The GitHub-hosted runners already ship an Android SDK. `android-actions/setup-android`
+      # is deliberately not used: it tries to install the legacy `tools` package, which no longer
+      # exists in Google's SDK repository, and that fails the whole job.
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        run: |
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          sdkmanager="$(ls -d "$sdk_root"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$sdkmanager" ]; then
+            echo "::error::No sdkmanager found under $sdk_root"
+            ls -R "$sdk_root" | head -50
+            exit 1
+          fi
+          echo "ANDROID_HOME=$sdk_root" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$sdk_root" >> "$GITHUB_ENV"
+          echo "$(dirname "$sdkmanager")" >> "$GITHUB_PATH"
+          echo "Using $sdkmanager"
+          yes | "$sdkmanager" --licenses > /dev/null 2>&1 || true
 
-      # The `packages` input of setup-android fails the whole job when a package name does not
-      # exist in the SDK repository. API 37 is published as `platforms;android-37.0` (the SDK now
-      # uses a minor version in the package id), so install it explicitly and keep a fallback.
+      # API 37 is published as `platforms;android-37.0` (the SDK now carries a minor version in the
+      # package id); keep fallbacks in case the repository is republished under another name.
       - name: Install SDK platform
         run: |
-          set -e
-          install() { sdkmanager --install "$@" > /dev/null 2>&1; }
-          install "platforms;android-37.0" "build-tools;37.0.0" \
-            || install "platforms;android-37.1" "build-tools;37.0.0" \
-            || install "platforms;android-37" "build-tools;37.0.0" \
-            || { echo "::error::Cannot install the Android 37 platform"; sdkmanager --list_installed; exit 1; }
+          sdkmanager="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -1)"
+          install_sdk() { "$sdkmanager" --install "$@" > /dev/null 2>&1; }
+          install_sdk "platforms;android-37.0" "build-tools;37.0.0" \
+            || install_sdk "platforms;android-37.1" "build-tools;37.0.0" \
+            || install_sdk "platforms;android-37" "build-tools;37.0.0" \
+            || { echo "::error::Cannot install the Android 37 platform"; "$sdkmanager" --list_installed; exit 1; }
           echo "Installed platforms:"; ls "$ANDROID_HOME/platforms"
+          echo "Installed build-tools:"; ls "$ANDROID_HOME/build-tools"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
