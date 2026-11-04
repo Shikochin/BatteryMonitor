@@ -49,6 +49,10 @@ data class ChartSample(
     val timestampMillis: Long,
     val levelPercent: Int,
     val style: ChartSegmentStyle,
+    /** Foreground package at this instant; `null` for points seeded from the system history. */
+    val packageName: String? = null,
+    /** Signed power draw in mW (negative while discharging), used to place the app icons. */
+    val powerMilliWatts: Float = 0f,
 )
 
 /** Aggregated numbers shown on the two summary rows. */
@@ -113,4 +117,6 @@ data class PowerUiState(
     val shizukuAvailable: Boolean = false,
     /** True when the Shizuku shell actually runs as uid 0 (Sui/root), so sysfs is readable. */
     val rootAvailable: Boolean = false,
+    /** True when the detached root sampling daemon is alive (collects while the app is frozen). */
+    val daemonRunning: Boolean = false,
 )

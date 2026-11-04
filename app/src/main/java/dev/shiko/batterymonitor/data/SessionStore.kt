@@ -104,6 +104,24 @@ internal class SessionStore(context: Context) {
     }
 
     // ---------------------------------------------------------------------------------------------
+    // Root sampling daemon (survives the app being frozen / killed)
+    // ---------------------------------------------------------------------------------------------
+
+    /** Byte offset into the daemon's sample log that has already been ingested. */
+    fun loadDaemonOffset(): Long = prefs.getLong(KEY_DAEMON_OFFSET, 0L)
+
+    fun saveDaemonOffset(offset: Long) {
+        prefs.edit().putLong(KEY_DAEMON_OFFSET, offset).apply()
+    }
+
+    /** Timestamp of the last daemon sample folded into the session (dedupe across restarts). */
+    fun loadDaemonLastSample(): Long = prefs.getLong(KEY_DAEMON_LAST_SAMPLE, 0L)
+
+    fun saveDaemonLastSample(timestampMillis: Long) {
+        prefs.edit().putLong(KEY_DAEMON_LAST_SAMPLE, timestampMillis).apply()
+    }
+
+    // ---------------------------------------------------------------------------------------------
     // Session history
     // ---------------------------------------------------------------------------------------------
 
@@ -160,6 +178,8 @@ internal class SessionStore(context: Context) {
         append(flags)
         append(FIELD_SEPARATOR)
         append(sample.remainingEnergyWattHours?.let { (it * 10f).roundToInt() } ?: -1)
+        append(FIELD_SEPARATOR)
+        append(sample.packageName ?: "")
     }
 
     private fun decodeSample(encoded: String): PowerSample? {
@@ -178,6 +198,7 @@ internal class SessionStore(context: Context) {
                 screenOn = flags and FLAG_SCREEN_ON != 0,
                 charging = flags and FLAG_CHARGING != 0,
                 remainingEnergyWattHours = parts[8].toInt().takeIf { it >= 0 }?.let { it / 10f },
+                packageName = parts.getOrNull(9)?.takeIf { it.isNotEmpty() },
             )
         }.getOrNull()
     }
@@ -225,6 +246,8 @@ internal class SessionStore(context: Context) {
         const val KEY_LAST_SAMPLE_LEVEL = "last_sample_level"
         const val KEY_PACKAGES = "packages"
         const val KEY_HISTORY = "history"
+        const val KEY_DAEMON_OFFSET = "daemon_offset"
+        const val KEY_DAEMON_LAST_SAMPLE = "daemon_last_sample"
 
         const val ENTRY_SEPARATOR = ";"
         const val FIELD_SEPARATOR = ","

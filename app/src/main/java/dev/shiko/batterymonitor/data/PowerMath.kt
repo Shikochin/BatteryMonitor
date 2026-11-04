@@ -22,6 +22,8 @@ internal data class PowerSample(
     val remainingEnergyWattHours: Float?,
     val screenOn: Boolean,
     val style: ChartSegmentStyle,
+    /** Foreground package when this sample was recorded. */
+    val packageName: String? = null,
 )
 
 /** Half-open wall-clock range `[startMillis, endMillis)` used for foreground attribution. */
@@ -57,8 +59,14 @@ internal object PowerMath {
     /** Sampling/tick cadence; Scene records every 1–3 s and treats a record as 3 s. */
     const val TICK_INTERVAL_MILLIS = 3_000L
 
-    /** "使用过程" chart horizon. */
+    /** "使用过程" chart viewport: the visible slice of the curve. */
     const val CHART_WINDOW_MILLIS = 45 * 60_000L
+
+    /** How much history is kept so the chart can be dragged beyond the 45 min viewport. */
+    const val CHART_RETENTION_MILLIS = 12L * 60L * 60_000L
+
+    /** Samples older than the viewport are thinned to one per this interval (size / prefs cost). */
+    const val CHART_OLD_SAMPLE_SPACING_MILLIS = 30_000L
 
     /** Scene's curve: a gap longer than this between two samples means "not recorded" (dotted). */
     const val MISSED_GAP_MILLIS = 10_000L

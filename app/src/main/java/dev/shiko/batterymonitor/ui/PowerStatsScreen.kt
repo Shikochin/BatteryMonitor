@@ -196,6 +196,7 @@ fun PowerStatsScreen(
                         shizukuGranted = state.shizukuGranted,
                         rootAvailable = state.rootAvailable,
                         shizukuAvailable = state.shizukuAvailable,
+                        daemonRunning = state.daemonRunning,
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(top = 4.dp),
@@ -254,15 +255,19 @@ private fun DataSourceRow(
     shizukuGranted: Boolean,
     rootAvailable: Boolean,
     shizukuAvailable: Boolean,
+    daemonRunning: Boolean,
     modifier: Modifier = Modifier,
 ) {
-    val text = when {
+    val source = when {
         // root reads continuous sysfs current; plain shell can only see `dumpsys battery`.
-        shizukuGranted && rootAvailable -> "数据来源：Shizuku (root)"
-        shizukuGranted -> "数据来源：Shizuku (shell)"
-        shizukuAvailable -> "数据来源：Shizuku (未授权)"
-        else -> "数据来源：Shizuku (未连接)"
+        shizukuGranted && rootAvailable -> "Shizuku (root)"
+        shizukuGranted -> "Shizuku (shell)"
+        shizukuAvailable -> "Shizuku (未授权)"
+        else -> "Shizuku (未连接)"
     }
+    // The daemon is what keeps collecting while Android freezes this process in the background.
+    val text = "数据来源：$source · 守护进程${if (daemonRunning) "运行中" else "未运行"}"
+
     Box(
         modifier = modifier,
         contentAlignment = Alignment.Center,

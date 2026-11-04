@@ -49,6 +49,15 @@ fun UsageProcessCard(
     val snapshot = state.snapshot
     val levelPercent = snapshot?.levelPercent ?: state.startLevelPercent
     var showLegend by remember { mutableStateOf(false) }
+    // Package -> launcher icon, so the chart can draw the same icons as the scenario list.
+    val chartIcons = remember(state.scenarios) {
+        buildMap {
+            for (scenario in state.scenarios) {
+                val icon = scenario.icon ?: continue
+                put(scenario.packageName, icon)
+            }
+        }
+    }
 
     Card(
         modifier = modifier.fillMaxWidth(),
@@ -75,8 +84,8 @@ fun UsageProcessCard(
 
         UsageChart(
             samples = state.chartSamples,
-            windowMillis = state.chartWindowMillis,
             startLevelPercent = state.startLevelPercent,
+            icons = chartIcons,
             modifier = Modifier
                 .fillMaxWidth()
                 .height(205.dp),

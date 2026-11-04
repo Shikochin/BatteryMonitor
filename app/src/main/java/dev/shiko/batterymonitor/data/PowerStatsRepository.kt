@@ -134,6 +134,25 @@ class PowerStatsRepository(context: Context) {
     /** Set when a sample could not be attributed to a package; triggers an early history refresh. */
     private var unattributedSampleSeen: Boolean = false
 
+    // --- root sampling daemon (keeps collecting while the app process is frozen) -----------------
+    private val daemon = RootMonitorDaemon(appContext)
+    private var daemonActive: Boolean = false
+    private var daemonOffset: Long = store.loadDaemonOffset()
+    private var lastDaemonSampleAt: Long = store.loadDaemonLastSample()
+    private var lastDaemonStartAttemptAt: Long = 0L
+    private var daemonIngestJob: Job? = null
+    private var daemonStartJob: Job? = null
+
+    /** Screen-on samples that could not be attributed yet; retried after the next `--history` fetch. */
+    private val pendingAttribution = ArrayDeque<PendingAttribution>()
+
+    // Daemon-side current calibration, kept apart from the live path's state.
+    private var daemonDivisor: Float? = null
+    private var daemonCounterAnchorMicroAmpHours: Long? = null
+    private var daemonCounterAnchorAtMillis: Long = 0L
+    private var daemonReferenceWatts: Float? = null
+    private var daemonReferenceAtMillis: Long = 0L
+
     // --- per-app presentation ---------------------------------------------------------------------
     private var scenarios: List<UsageScenario> = emptyList()
     private var visualCache: Map<String, PackageVisuals.AppVisual> = emptyMap()
@@ -186,6 +205,7 @@ class PowerStatsRepository(context: Context) {
         lastPermissionCheckMillis = System.currentTimeMillis()
         refreshShizukuFlags()
         maybeRequestShizukuPermissionUpFront()
+        startRootDaemon()
 
         requestBatteryReading(screenStateOverride = null, force = true)
         tickJob = scope.launch {
@@ -233,6 +253,9 @@ class PowerStatsRepository(context: Context) {
         resetSessionState(now, lastReading?.levelPercent ?: lastSnapshot?.levelPercent, allowHistorySeed = false)
 
         store.clearSession()
+        // Everything the daemon wrote before this reset belongs to the wiped session: skip it.
+        lastDaemonSampleAt = System.currentTimeMillis()
+        store.saveDaemonLastSample(lastDaemonSampleAt)
         lastReading = null
         lastSnapshot = null
         latestPowerWatts = null
@@ -334,6 +357,7 @@ class PowerStatsRepository(context: Context) {
             if (granted) {
                 requestBatteryReading(force = true)
                 restartStatsPipeline(showLoading = true)
+                startRootDaemon()
             }
             publish()
         }
@@ -354,6 +378,7 @@ class PowerStatsRepository(context: Context) {
         lastSnapshot = null
         latestPowerWatts = null
         lastPowerDump = null
+        daemonActive = false
         lastValidPowerWatts = null
         counterReferenceWatts = null
         lockedCurrentDivisor = null
@@ -380,6 +405,16 @@ class PowerStatsRepository(context: Context) {
         val now = System.currentTimeMillis()
         maybeRefreshShizukuState(now)
         requestBatteryReading()
+        if (daemonActive) {
+            requestDaemonIngest()
+            recoverDaemonIfStalled(now)
+        } else {
+            startRootDaemon()
+        }
+        // Keep the "still open" foreground interval stretching to now: it is rebuilt from the last
+        // `--history` dump, so without this the app on screen stops matching ~30 s after the dump
+        // and its samples would be dropped.
+        if (intervalIndex.isNotEmpty()) rebuildIntervalIndex()
         // The scenario list is pure aggregation over the in-memory session samples, so it is
         // recomputed on every tick (3 s) like the rest of the screen — no extra shell traffic.
         ensureVisualsForAggregates()
@@ -612,7 +647,9 @@ class PowerStatsRepository(context: Context) {
             powerWatts = powerWatts,
         )
         latestPowerWatts = powerWatts
-        handleSampling(reading, screenOn, now)
+        // With the root daemon running the session samples come from the daemon (it keeps collecting
+        // while this process is frozen); the live read now only feeds the telemetry header.
+        if (!daemonActive) handleSampling(reading, screenOn, now)
         ensureVisualsForAggregates()
         rebuildScenariosIfChanged()
         publish()
@@ -650,14 +687,22 @@ class PowerStatsRepository(context: Context) {
      * final `screenOn = false` sample is stored (that is Scene's grey chart segment); charging
      * periods record nothing at all.
      */
-    private fun handleSampling(reading: BatteryReading, screenOn: Boolean, nowMillis: Long) {
+    private fun handleSampling(
+        reading: BatteryReading,
+        screenOn: Boolean,
+        nowMillis: Long,
+        attributedPackage: String? = null,
+    ) {
         when {
             reading.charging -> lastSampleWasScreenOn = false
 
-            reading.discharging && screenOn -> recordSample(reading, screenOn = true, nowMillis = nowMillis)
+            reading.discharging && screenOn ->
+                recordSample(reading, screenOn = true, nowMillis = nowMillis, attributedPackage = attributedPackage)
 
             reading.discharging && !screenOn -> {
-                if (lastSampleWasScreenOn) recordSample(reading, screenOn = false, nowMillis = nowMillis)
+                if (lastSampleWasScreenOn) {
+                    recordSample(reading, screenOn = false, nowMillis = nowMillis, attributedPackage = attributedPackage)
+                }
                 lastSampleWasScreenOn = false
             }
 
@@ -665,7 +710,12 @@ class PowerStatsRepository(context: Context) {
         }
     }
 
-    private fun recordSample(reading: BatteryReading, screenOn: Boolean, nowMillis: Long) {
+    private fun recordSample(
+        reading: BatteryReading,
+        screenOn: Boolean,
+        nowMillis: Long,
+        attributedPackage: String? = null,
+    ) {
         if (sessionStartMillis == null) beginSession(reading.levelPercent)
         if (shouldStartNewSession(reading, nowMillis)) beginNewSession(reading.levelPercent)
 
@@ -674,7 +724,7 @@ class PowerStatsRepository(context: Context) {
             sessionSampleCount++
             sessionPowerMilliWattSum += powerMilliWatts
             // Scene's SQL only filters `package != ''`, so our own package is listed too.
-            val packageName = packageAt(nowMillis)
+            val packageName = attributedPackage ?: packageAt(nowMillis)
             if (packageName != null) {
                 val aggregate = packageAggregates[packageName] ?: PackageAggregate()
                 packageAggregates[packageName] = aggregate.add(
@@ -684,10 +734,11 @@ class PowerStatsRepository(context: Context) {
                 )
             } else {
                 unattributedSampleSeen = true
+                rememberPendingAttribution(nowMillis, powerMilliWatts, reading)
             }
         }
 
-        appendChartPoint(reading, screenOn, nowMillis)
+        appendChartPoint(reading, screenOn, nowMillis, attributedPackage.takeIf { screenOn })
         lastSampleAtMillis = nowMillis
         lastSampleLevel = reading.levelPercent
         lastSampleWasScreenOn = screenOn
@@ -719,7 +770,12 @@ class PowerStatsRepository(context: Context) {
     // =============================================================================================
 
     /** Appends one chart point; gaps over 10 s become the dotted `MissedRecord*` variants. */
-    private fun appendChartPoint(reading: BatteryReading, screenOn: Boolean, nowMillis: Long) {
+    private fun appendChartPoint(
+        reading: BatteryReading,
+        screenOn: Boolean,
+        nowMillis: Long,
+        packageName: String? = null,
+    ) {
         val previous = lastChartPointAtMillis
         val missed = previous > 0L && PowerMath.isMissedRecord(nowMillis - previous)
         val style = PowerMath.segmentStyle(screenOn, missed)
@@ -735,6 +791,7 @@ class PowerStatsRepository(context: Context) {
                 remainingEnergyWattHours = lastSnapshot?.remainingEnergyWattHours,
                 screenOn = screenOn,
                 style = style,
+                packageName = packageName,
             ),
         )
         lastChartPointAtMillis = nowMillis
@@ -742,17 +799,48 @@ class PowerStatsRepository(context: Context) {
         rebuildChartSamples()
     }
 
+    /**
+     * Keeps [PowerMath.CHART_RETENTION_MILLIS] of history so the chart can be dragged past its
+     * 45 min viewport. Samples older than the viewport are thinned to one per 30 s: 12 h of that
+     * fits comfortably in memory and in SharedPreferences.
+     */
     private fun trimChartWindow(nowMillis: Long) {
-        val threshold = nowMillis - PowerMath.CHART_WINDOW_MILLIS
-        while (windowSamples.isNotEmpty() && windowSamples.first().timestampMillis < threshold) {
+        val retentionThreshold = nowMillis - PowerMath.CHART_RETENTION_MILLIS
+        while (windowSamples.isNotEmpty() && windowSamples.first().timestampMillis < retentionThreshold) {
             windowSamples.removeAt(0)
         }
+        downsampleBeyondDetailWindow(nowMillis)
         while (windowSamples.size > MAX_CHART_SAMPLES) windowSamples.removeAt(0)
+    }
+
+    /** One sample per [PowerMath.CHART_OLD_SAMPLE_SPACING_MILLIS] outside the detailed viewport. */
+    private fun downsampleBeyondDetailWindow(nowMillis: Long) {
+        val detailThreshold = nowMillis - PowerMath.CHART_WINDOW_MILLIS
+        var index = 0
+        var previousKeptAt = Long.MIN_VALUE
+        while (index < windowSamples.size) {
+            val timestamp = windowSamples[index].timestampMillis
+            if (timestamp >= detailThreshold) break
+            if (previousKeptAt != Long.MIN_VALUE &&
+                timestamp - previousKeptAt < PowerMath.CHART_OLD_SAMPLE_SPACING_MILLIS
+            ) {
+                windowSamples.removeAt(index)
+            } else {
+                previousKeptAt = timestamp
+                index++
+            }
+        }
     }
 
     private fun rebuildChartSamples() {
         chartSamples = windowSamples.map {
-            ChartSample(it.timestampMillis, it.levelPercent, it.style)
+            ChartSample(
+                timestampMillis = it.timestampMillis,
+                levelPercent = it.levelPercent,
+                style = it.style,
+                packageName = it.packageName,
+                powerMilliWatts = it.powerMilliWatts,
+            )
         }
     }
 
@@ -868,16 +956,21 @@ class PowerStatsRepository(context: Context) {
      * the sample.
      */
     private fun packageAt(timestampMillis: Long): String? {
+        var best: IntervalEntry? = null
         var fallback: IntervalEntry? = null
         for (entry in intervalIndex) {
-            if (timestampMillis in entry.startMillis until entry.endMillis) return entry.packageName
+            if (timestampMillis in entry.startMillis until entry.endMillis) {
+                // Intervals of "still open" apps are extended to now and may overlap; the one that
+                // started last is the app that actually came to the foreground most recently.
+                if (best == null || entry.startMillis >= best.startMillis) best = entry
+            }
             if (entry.endMillis <= timestampMillis &&
                 timestampMillis - entry.endMillis <= PACKAGE_FALLBACK_WINDOW_MILLIS
             ) {
                 if (fallback == null || entry.endMillis > fallback.endMillis) fallback = entry
             }
         }
-        return fallback?.packageName
+        return best?.packageName ?: fallback?.packageName
     }
 
     private fun rebuildIntervalIndex() {
@@ -925,6 +1018,217 @@ class PowerStatsRepository(context: Context) {
     }
 
     // =============================================================================================
+    // Root sampling daemon
+    // =============================================================================================
+
+    /** Starts the detached root sampler (idempotent; retried at most once a minute). */
+    private fun startRootDaemon() {
+        if (daemonActive) return
+        if (!shizukuGranted) return
+        // One attempt at a time: two concurrent spawns would leave two daemons writing the log.
+        if (daemonStartJob?.isActive == true) return
+        val now = System.currentTimeMillis()
+        if (now - lastDaemonStartAttemptAt < DAEMON_START_RETRY_MILLIS) return
+        lastDaemonStartAttemptAt = now
+        daemonStartJob = scope.launch {
+            val started = withContext(Dispatchers.IO) {
+                runCatching { daemon.ensureRunning() }.getOrDefault(false)
+            }
+            daemonActive = started
+            android.util.Log.d("BatteryDaemon", "daemonActive=$started")
+            if (started) requestDaemonIngest()
+            publish()
+        }
+    }
+
+    /** Falls back to in-process sampling when the daemon stopped writing samples. */
+    private fun recoverDaemonIfStalled(nowMillis: Long) {
+        val last = lastDaemonSampleAt
+        if (last <= 0L) return
+        if (nowMillis - last <= DAEMON_STALL_MILLIS) return
+        daemonActive = false
+        lastDaemonStartAttemptAt = 0L
+        startRootDaemon()
+    }
+
+    /** Reads the samples the daemon wrote since the last ingest and folds them into the session. */
+    private fun requestDaemonIngest() {
+        if (!daemonActive) return
+        if (daemonIngestJob?.isActive == true) return
+        daemonIngestJob = scope.launch {
+            val batch = withContext(Dispatchers.IO) {
+                runCatching { daemon.readNew(daemonOffset) }.getOrNull()
+            } ?: return@launch
+            if (batch.samples.isEmpty() && batch.nextOffset == daemonOffset) return@launch
+
+            daemonOffset = batch.nextOffset
+            store.saveDaemonOffset(batch.nextOffset)
+
+            var applied = 0
+            for (sample in batch.samples) {
+                if (sample.timestampMillis <= lastDaemonSampleAt) continue
+                applyDaemonSample(sample)
+                applied++
+            }
+            if (applied > 0) {
+                store.saveDaemonLastSample(lastDaemonSampleAt)
+                ensureVisualsForAggregates()
+                rebuildScenariosIfChanged()
+                persistSessionIfDue(System.currentTimeMillis())
+                publish()
+            }
+        }
+    }
+
+    /**
+     * Turns one daemon sample into the same pipeline the live reader uses.
+     *
+     * The daemon already knows the foreground package, so a background sample can be attributed
+     * without waiting for the next `dumpsys batterystats --history` dump.
+     */
+    private fun applyDaemonSample(sample: DaemonSample) {
+        lastDaemonSampleAt = maxOf(lastDaemonSampleAt, sample.timestampMillis)
+        val start = sessionStartMillis
+        if (start != null && sample.timestampMillis < start) return
+
+        val raw = RawBatteryReading(
+            levelPercent = sample.levelPercent,
+            voltageVolts = sample.voltageVolts,
+            rawCurrent = sample.rawCurrent,
+            temperatureCelsius = sample.temperatureCelsius,
+            status = sample.status,
+            chargeCounterMicroAmpHours = sample.chargeCounterMicroAmpHours,
+            chargeFullMilliAmpHours = sample.chargeFullMilliAmpHours,
+        )
+        val rawCurrent = raw.rawCurrent ?: return
+        val calibration = CurrentCalibrator.calibrate(
+            rawCurrent = rawCurrent,
+            voltageVolts = raw.voltageVolts,
+            referencePowerWatts = daemonReferencePower(sample),
+            discharging = raw.discharging,
+            preferredDivisor = daemonDivisor,
+        ) ?: return
+        daemonDivisor = calibration.divisor
+
+        val reading = BatteryReading(
+            levelPercent = raw.levelPercent,
+            voltageVolts = raw.voltageVolts,
+            currentMilliAmps = calibration.milliAmps,
+            temperatureCelsius = raw.temperatureCelsius,
+            status = raw.status,
+            chargeCounterMicroAmpHours = raw.chargeCounterMicroAmpHours,
+            chargeFullMilliAmpHours = raw.chargeFullMilliAmpHours,
+        )
+        handleSampling(
+            reading = reading,
+            screenOn = sample.screenOn,
+            nowMillis = sample.timestampMillis,
+            attributedPackage = sample.foregroundPackage,
+        )
+    }
+
+    /** Reference power from the charge counter over a window long enough for its 1 mAh resolution. */
+    private fun daemonReferencePower(sample: DaemonSample): Float? {
+        val counter = sample.chargeCounterMicroAmpHours
+        if (counter != null && sample.voltageVolts > 0f) {
+            val anchor = daemonCounterAnchorMicroAmpHours
+            if (anchor == null) {
+                daemonCounterAnchorMicroAmpHours = counter
+                daemonCounterAnchorAtMillis = sample.timestampMillis
+            } else {
+                val elapsed = sample.timestampMillis - daemonCounterAnchorAtMillis
+                val delta = abs(counter - anchor)
+                if (elapsed >= DAEMON_COUNTER_WINDOW_MILLIS &&
+                    delta >= MIN_COUNTER_DELTA_MICRO_AMP_HOURS
+                ) {
+                    val hours = elapsed / 3_600_000f
+                    if (hours > 0f) {
+                        val watts = delta / 1_000_000f * sample.voltageVolts / hours
+                        if (watts in PowerMath.MIN_POWER_WATTS..PowerMath.MAX_POWER_WATTS) {
+                            daemonReferenceWatts = watts
+                            daemonReferenceAtMillis = sample.timestampMillis
+                        }
+                    }
+                    daemonCounterAnchorMicroAmpHours = counter
+                    daemonCounterAnchorAtMillis = sample.timestampMillis
+                }
+            }
+        }
+        val reference = daemonReferenceWatts ?: return null
+        if (sample.timestampMillis - daemonReferenceAtMillis >
+            COUNTER_REFERENCE_VALIDITY_MILLIS * 2
+        ) {
+            return null
+        }
+        return reference
+    }
+
+    private fun rememberPendingAttribution(
+        timestampMillis: Long,
+        powerMilliWatts: Float,
+        reading: BatteryReading,
+    ) {
+        if (pendingAttribution.size >= MAX_PENDING_ATTRIBUTIONS) pendingAttribution.removeFirst()
+        pendingAttribution.addLast(
+            PendingAttribution(
+                timestampMillis = timestampMillis,
+                powerMilliWatts = powerMilliWatts,
+                currentMilliAmps = reading.currentMilliAmps,
+                temperatureCelsius = reading.temperatureCelsius,
+            ),
+        )
+        unattributedSampleSeen = true
+    }
+
+    /** Re-attributes samples that had no interval when they were recorded (after a history dump). */
+    private fun retryPendingAttribution() {
+        if (pendingAttribution.isEmpty()) {
+            unattributedSampleSeen = false
+            return
+        }
+        val iterator = pendingAttribution.iterator()
+        while (iterator.hasNext()) {
+            val pending = iterator.next()
+            val packageName = packageAt(pending.timestampMillis) ?: continue
+            val aggregate = packageAggregates[packageName] ?: PackageAggregate()
+            packageAggregates[packageName] = aggregate.add(
+                currentMilliAmps = pending.currentMilliAmps,
+                powerMilliWatts = pending.powerMilliWatts,
+                temperatureCelsius = pending.temperatureCelsius,
+            )
+            iterator.remove()
+        }
+        unattributedSampleSeen = pendingAttribution.isNotEmpty()
+    }
+
+    /**
+     * Assigns a foreground package to already-recorded chart points that have none.
+     *
+     * Samples recorded by an older build (or restored from persistence before the first history
+     * dump) carry no package, so their app icons would be missing from the curve.
+     */
+    private fun backfillChartPackages() {
+        if (intervalIndex.isEmpty() || windowSamples.isEmpty()) return
+        var changed = false
+        for (index in windowSamples.indices) {
+            val sample = windowSamples[index]
+            if (sample.packageName != null || !sample.screenOn) continue
+            val packageName = packageAt(sample.timestampMillis) ?: continue
+            windowSamples[index] = sample.copy(packageName = packageName)
+            changed = true
+        }
+        if (changed) rebuildChartSamples()
+    }
+
+    /** One screen-on sample waiting for a foreground interval to attribute it to. */
+    private data class PendingAttribution(
+        val timestampMillis: Long,
+        val powerMilliWatts: Float,
+        val currentMilliAmps: Float,
+        val temperatureCelsius: Float,
+    )
+
+    // =============================================================================================
     // Stats pipeline (foreground intervals, learned capacity, chart history)
     // =============================================================================================
 
@@ -963,25 +1267,27 @@ class PowerStatsRepository(context: Context) {
         }
         if (statsText != null) {
             val powerDump = SystemBatteryStatsSource.parsePowerDump(statsText)
-            val windowStart = fetchedAt - PowerMath.CHART_WINDOW_MILLIS
+            val chartWindowStart = fetchedAt - PowerMath.CHART_WINDOW_MILLIS
             val windowEnd = fetchedAt + HISTORY_CLOCK_SKEW_MILLIS
+            // Samples recorded by the daemon can be older than the 45 min chart window (the app may
+            // have been frozen for a while). Widen the interval window to cover the unattributed
+            // backlog so those samples can still be assigned to the app that was on screen.
+            val intervalWindowStart = maxOf(
+                minOf(chartWindowStart, (pendingAttribution.firstOrNull()?.timestampMillis ?: fetchedAt) - 60_000L),
+                fetchedAt - MAX_HISTORY_LOOKBACK_MILLIS,
+            )
             var intervals: Map<String, List<TimeInterval>>? = null
             var history: List<SystemBatteryStatsSource.HistoryPoint> = emptyList()
             if (historyDue) {
                 intervals = SystemBatteryStatsSource.parseForegroundIntervals(
                     statsText,
-                    windowStart,
+                    intervalWindowStart,
                     windowEnd,
                     fetchedAt,
                 )
-                if (historySeedAllowed && windowSamples.isEmpty()) {
-                    history = SystemBatteryStatsSource.parseBatteryHistory(
-                        statsText,
-                        windowStart,
-                        windowEnd,
-                        fetchedAt,
-                    )
-                }
+                // The chart's time axis counts recorded usage, so it is built only from our own
+                // samples; seeding it with the system's 30 s history heartbeat would place points
+                // on a different time base and make the curve longer than "已使用".
             }
             applyStats(powerDump, history, intervals, fetchedAt)
             if (historyDue) lastHistoryFetchMillis = fetchedAt
@@ -998,10 +1304,13 @@ class PowerStatsRepository(context: Context) {
      */
     private fun isHistoryDue(nowMillis: Long): Boolean {
         if (lastHistoryFetchMillis == 0L) return true
-        if (nowMillis - lastHistoryFetchMillis >= HISTORY_REFRESH_INTERVAL_MILLIS) return true
-        val needsIntervals = unattributedSampleSeen ||
-            packageAggregates.keys.any { !foregroundIntervals.containsKey(it) }
-        return needsIntervals && nowMillis - lastHistoryFetchMillis >= MIN_HISTORY_RETRY_MILLIS
+        // The daemon attributes samples itself, so a history dump is only needed for the chart seed
+        // and for the rare unattributed sample. Without the daemon the dump *is* the attribution
+        // source, so keep it fresh (the foreground app can change at any time).
+        val refreshInterval =
+            if (daemonActive) HISTORY_REFRESH_INTERVAL_MILLIS else HISTORY_REFRESH_ACTIVE_MILLIS
+        if (nowMillis - lastHistoryFetchMillis >= refreshInterval) return true
+        return unattributedSampleSeen && nowMillis - lastHistoryFetchMillis >= MIN_HISTORY_RETRY_MILLIS
     }
 
     private fun applyStats(
@@ -1018,12 +1327,11 @@ class PowerStatsRepository(context: Context) {
         if (intervals != null) {
             foregroundIntervals = intervals
             intervalsFetchedAtMillis = fetchedAtMillis
-            unattributedSampleSeen = false
             rebuildIntervalIndex()
+            retryPendingAttribution()
+            backfillChartPackages()
         }
-        if (history.size >= MIN_HISTORY_POINTS) {
-            historyChartSamples = toChartSamples(history)
-        }
+        // chart samples are recorded samples only (see the note in refreshStats).
     }
 
     // =============================================================================================
@@ -1050,6 +1358,8 @@ class PowerStatsRepository(context: Context) {
         lastSampleLevel = -1
         lastSampleWasScreenOn = false
         lastSamplesPersistedAtMillis = 0L
+        pendingAttribution.clear()
+        unattributedSampleSeen = false
     }
 
     private fun archiveCurrentSession(nowMillis: Long, endLevelPercent: Int?) {
@@ -1079,7 +1389,7 @@ class PowerStatsRepository(context: Context) {
         lastSampleAtMillis = stored.lastSampleAtMillis
         lastSampleLevel = stored.lastSampleLevel
 
-        val threshold = System.currentTimeMillis() - PowerMath.CHART_WINDOW_MILLIS
+        val threshold = System.currentTimeMillis() - PowerMath.CHART_RETENTION_MILLIS
         for (sample in store.loadSamples()) {
             if (sample.timestampMillis >= threshold) windowSamples.add(sample)
         }
@@ -1132,6 +1442,7 @@ class PowerStatsRepository(context: Context) {
                 shizukuGranted = shizukuGranted,
                 shizukuAvailable = shizukuAvailable,
                 rootAvailable = rootAvailable,
+                daemonRunning = daemonActive,
             )
         }
     }
@@ -1179,8 +1490,26 @@ class PowerStatsRepository(context: Context) {
         /** `dumpsys batterystats --charged` cadence; the 3 s tick re-emits cached values in between. */
         const val MIN_STATS_REFRESH_INTERVAL_MILLIS = 6_000L
 
-        /** `--history` (foreground intervals + chart seed) cadence. */
+        /** `--history` (foreground intervals + chart seed) cadence while the daemon is running. */
         const val HISTORY_REFRESH_INTERVAL_MILLIS = 60L * 60_000L
+
+        /** `--history` cadence without the daemon: it is then the only attribution source. */
+        const val HISTORY_REFRESH_ACTIVE_MILLIS = 2L * 60_000L
+
+        /** How far back a `--history` dump may be parsed to attribute daemon samples. */
+        const val MAX_HISTORY_LOOKBACK_MILLIS = 12L * 60L * 60_000L
+
+        /** Retry cadence for starting the root daemon. */
+        const val DAEMON_START_RETRY_MILLIS = 60_000L
+
+        /** No new daemon sample for this long means it died; fall back to in-process sampling. */
+        const val DAEMON_STALL_MILLIS = 90_000L
+
+        /** Charge-counter window used to calibrate daemon samples (1 mAh gauge resolution). */
+        const val DAEMON_COUNTER_WINDOW_MILLIS = 60_000L
+
+        /** Screen-on samples kept for attribution retry; older ones are dropped. */
+        const val MAX_PENDING_ATTRIBUTIONS = 4_000
 
         /** Extra history fetch when a sampled package has no interval yet (rate limit). */
         const val MIN_HISTORY_RETRY_MILLIS = 60_000L
@@ -1228,7 +1557,7 @@ class PowerStatsRepository(context: Context) {
         /** Finished sessions kept by "清理数据" / automatic session resets. */
         const val MAX_SESSION_HISTORY = 20
 
-        /** Hard cap on chart points (the 45 min window holds ≤ 900 at 3 s). */
-        const val MAX_CHART_SAMPLES = 1_000
+        /** Hard cap on retained chart points (45 min at 3 s + 12 h at 30 s ≈ 2 400). */
+        const val MAX_CHART_SAMPLES = 3_000
     }
 }
