@@ -133,4 +133,8 @@ data class PowerUiState(
     val daemonState: DaemonState = DaemonState.UNKNOWN,
     /** True while a manual "restart sampler" request is in flight. */
     val daemonRestarting: Boolean = false,
+    /** True while the user has paused recording: no sample is taken until it is resumed. */
+    val recordingPaused: Boolean = false,
+    /** True while a pause/resume request is being applied (the sampler is stopped or started). */
+    val recordingPauseBusy: Boolean = false,
 )

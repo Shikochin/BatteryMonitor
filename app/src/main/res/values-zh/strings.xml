@@ -11,6 +11,12 @@
     <string name="action_restarting">重启中…</string>
     <string name="action_close">关闭</string>
 
+    <!-- 记录暂停 -->
+    <string name="action_pause_recording">暂停记录</string>
+    <string name="action_resume_recording">继续记录</string>
+    <string name="recording_paused_title">已暂停记录</string>
+    <string name="recording_paused_hint">暂停期间不记录任何数据，图表中该时段显示为虚线，也不计入使用时间与功耗统计。</string>
+
     <!-- 下拉刷新 -->
     <string name="pull_to_refresh">下拉刷新</string>
     <string name="release_to_refresh">松开刷新</string>
@@ -30,6 +36,7 @@
     <string name="daemon_running">运行中</string>
     <string name="daemon_stopped">未运行</string>
     <string name="daemon_unknown">状态未知</string>
+    <string name="daemon_paused">已暂停</string>
     <string name="data_source_line">数据来源：%1$s · 守护进程%2$s</string>
 
     <!-- 卡片标题 -->
@@ -54,7 +61,7 @@
     <string name="legend_missed_screen_on">屏幕点亮，未记录电池状态</string>
     <string name="legend_missed_screen_off">屏幕关闭，未记录电池状态</string>
     <string name="legend_hint_screen_off">在手机屏幕关闭时，本应用会停止记录电池状态以减少耗电，在图表中显示为灰色虚线。</string>
-    <string name="legend_hint_missed">但如果图表中出现蓝色虚线，说明后台进程被休眠，未能按计划的频率记录电池状态。</string>
+    <string name="legend_hint_missed">蓝色虚线表示后台进程被挂起、没能按计划记录电池状态——或者你主动暂停了记录。</string>
     <string name="legend_got_it">我知道了</string>
 
     <!-- 历史记录 -->

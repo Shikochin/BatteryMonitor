@@ -179,6 +179,31 @@ internal class RootMonitorDaemon(context: Context) {
     }
 
     /**
+     * Kills every running sampler and leaves no pid/state/lock file behind.
+     *
+     * This is the user-facing "pause recording" action: with no sampler alive nothing is appended
+     * to the log, so a paused stretch is a real gap instead of samples that later get filtered out.
+     * Returns `true` only when the stop command itself went through *and* the process table proves
+     * that no sampler is left: a partially failed stop can leave a survivor behind, and [status]
+     * maps exactly that survivor (a live sampler the pidfile no longer names) to `STOPPED`, so the
+     * state alone is not enough — the instance count has to be zero. Callers must keep
+     * [ensureRunning] and [restart] away while the user has recording paused.
+     */
+    @Synchronized
+    fun stop(): Boolean {
+        if (!ShizukuBridge.hasPermission()) {
+            Log.d(TAG, "stop: no Shizuku permission")
+            return false
+        }
+        val issued = stopAll()
+        val after = status()
+        // An `UNKNOWN` probe proved nothing at all, and a live instance disproves the stop.
+        val verified = after.state != DaemonState.UNKNOWN && after.instances == 0
+        Log.d(TAG, "stop: issued=$issued state=${after.state} instances=${after.instances}")
+        return issued && verified
+    }
+
+    /**
      * Reads the samples written since [fromOffset].
      *
      * Direct file access is tried first (the file lives in the app's own data dir). If SELinux
@@ -274,8 +299,9 @@ internal class RootMonitorDaemon(context: Context) {
     // Spawning / stopping
     // ---------------------------------------------------------------------------------------------
 
-    private fun stopAll() {
-        ShizukuBridge.exec(stopCommand(), timeoutMillis = STOP_TIMEOUT_MILLIS)
+    private fun stopAll(): Boolean {
+        val output = ShizukuBridge.exec(stopCommand(), timeoutMillis = STOP_TIMEOUT_MILLIS)
+        return output?.contains(STOPPED_MARKER) == true
     }
 
     /**

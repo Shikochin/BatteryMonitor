@@ -168,6 +168,18 @@ class PowerStatsRepository(context: Context) {
     private var daemonStartJob: Job? = null
     private var daemonRestartJob: Job? = null
 
+    /**
+     * `true` while the user has paused recording.
+     *
+     * Restored from [SessionStore] on start-up: a pause must survive the app being killed (and the
+     * watchdog reads the same flag), otherwise the next launch would silently start recording again.
+     */
+    private var recordingPaused: Boolean = store.loadRecordingPaused()
+    /** True while a pause/resume request is in flight; blocks a second toggle from racing it. */
+    private var recordingPauseBusy: Boolean = false
+    /** One-shot "the previous process paused us" enforcement, run once per start-up. */
+    private var daemonPauseEnforceJob: Job? = null
+
     /** `true` only while a probe has verified exactly one healthy sampler. */
     private val daemonActive: Boolean get() = daemonState == DaemonState.RUNNING
 
@@ -205,6 +217,14 @@ class PowerStatsRepository(context: Context) {
 
     init {
         restoreSession()
+        // A process can die between persisting the pause flag and persisting the session, which
+        // leaves a restored session that still says "discharging". `currentSummary` would then
+        // project the whole paused stretch into `已使用` while the banner says paused; a paused
+        // session must project nothing, so the segment is closed here as well.
+        if (recordingPaused) {
+            lastSampleWasScreenOn = false
+            lastSampleWasDischarging = false
+        }
         refreshShizukuFlags()
         lastPermissionCheckMillis = System.currentTimeMillis()
         publish()
@@ -246,6 +266,8 @@ class PowerStatsRepository(context: Context) {
             } else {
                 maybeRequestShizukuPermissionUpFront()
             }
+            // A pause persisted by the previous process: no sampler may have outlived it.
+            if (recordingPaused) stopSamplerWhilePaused()
         }
         DaemonWatchdog.schedule(appContext)
 
@@ -279,6 +301,9 @@ class PowerStatsRepository(context: Context) {
      */
     fun onAppForeground() {
         refreshShizukuState()
+        // Nothing is sampled while recording is paused, so there is no sampler to probe or revive;
+        // the pause banner is the only affordance and it must not be overwritten by a stale probe.
+        if (recordingPaused) return
         // A quick round-trip (permission dialog, recents) keeps the fresh state; after a real
         // absence the old snapshot is worthless, so show "unknown" until the probe lands rather
         // than a potentially hours-old "running".
@@ -295,6 +320,72 @@ class PowerStatsRepository(context: Context) {
      * died — the summary card and the scenario list start moving again as soon as it is back.
      */
     fun restartDaemon() = restartDaemonInternal("manual", showUi = true)
+
+    /**
+     * Pauses or resumes recording.
+     *
+     * Pausing is a real stop, not a filtered ingest: the detached sampler is killed, so nothing is
+     * appended to `samples.log`, and the current discharge segment is closed at the pause instant.
+     * The paused stretch therefore neither moves the curve nor grows `已使用` / `平均功耗`. The
+     * session itself is kept: on resume the sampler starts again and the curve continues from the
+     * current moment, with the pause drawn as a dashed (not recorded) segment.
+     *
+     * The flag is persisted, so a process death or a reboot cannot silently resume recording; the
+     * watchdog job reads the same flag before it revives the sampler.
+     */
+    fun setRecordingPaused(paused: Boolean) {
+        if (recordingPaused == paused) return
+        if (recordingPauseBusy) return
+        recordingPaused = paused
+
+        if (paused) {
+            // Close the segment *now*: the pause instant must not be counted as usage. Capped at
+            // one tick like every other close path, so a stale last sample (e.g. the app was killed
+            // while recording and reopened just now) cannot dump hours of unrecorded time into the
+            // totals at the last sample's power.
+            val now = System.currentTimeMillis()
+            accumulateDischargeUntil(now, maxElapsedMillis = PowerMath.TICK_INTERVAL_MILLIS)
+            lastSampleWasScreenOn = false
+            lastSampleWasDischarging = false
+            lastDaemonHeartbeatMillis = 0L
+            daemonHeartbeatStuckAt = 0L
+            persistSession()
+        }
+
+        recordingPauseBusy = true
+        publish()
+
+        scope.launch {
+            val applied = withContext(Dispatchers.IO) {
+                // Persist before touching the sampler: the watchdog reads this flag to decide
+                // whether it may revive the sampler, so it has to be durable first. `commit()`
+                // rewrites the whole prefs file (chart samples included), hence the IO dispatcher.
+                store.saveRecordingPaused(paused)
+                daemonOps.withLock {
+                    runCatching {
+                        if (paused) daemon.stop() else resumeSampler()
+                    }.getOrDefault(false)
+                }
+            }
+            val now = System.currentTimeMillis()
+            lastDaemonProbeAt = now
+            lastDaemonStartAttemptAt = now
+            daemonState = if (paused) {
+                if (applied) DaemonState.STOPPED else DaemonState.UNKNOWN
+            } else {
+                if (applied) DaemonState.RUNNING else DaemonState.STOPPED
+            }
+            if (!paused && applied) {
+                lastDaemonHeartbeatMillis = 0L
+                daemonHeartbeatStuckAt = 0L
+                lastDaemonRecoveryAt = 0L
+            }
+            recordingPauseBusy = false
+            android.util.Log.w("BatteryDaemon", "recording paused=$paused samplerApplied=$applied")
+            publish()
+            if (!paused && applied) requestDaemonIngest()
+        }
+    }
 
     /** Re-reads the app list (labels/icons) and the system numbers. */
     fun refreshScenarios() {
@@ -781,6 +872,13 @@ class PowerStatsRepository(context: Context) {
         nowMillis: Long,
         attributedPackage: String? = null,
     ) {
+        // Recording paused: nothing is charted or aggregated. The segment was already closed when
+        // the pause was applied, so the paused stretch is not counted as usage either.
+        if (recordingPaused) {
+            lastSampleWasScreenOn = false
+            lastSampleWasDischarging = false
+            return
+        }
         when {
             reading.charging -> {
                 accumulateDischargeUntil(
@@ -1157,6 +1255,8 @@ class PowerStatsRepository(context: Context) {
      */
     private fun maintainDaemon(force: Boolean = false) {
         if (!monitoring) return
+        // Recording paused: the sampler must stay dead, and probing it would only cost a root exec.
+        if (recordingPaused) return
         if (daemonRestartInFlight) return
         if (daemonMaintainJob?.isActive == true) return
         val now = System.currentTimeMillis()
@@ -1196,6 +1296,8 @@ class PowerStatsRepository(context: Context) {
 
     /** Starts the detached root sampler when it is not the single healthy instance. */
     private fun ensureDaemonStarted(reason: String, force: Boolean = false) {
+        // A paused app never (re)starts the sampler: that is the whole point of the pause.
+        if (recordingPaused) return
         if (!shizukuGranted) return
         if (!rootAvailable) return
         if (daemonRestartInFlight) return
@@ -1207,10 +1309,19 @@ class PowerStatsRepository(context: Context) {
 
         daemonStartJob = scope.launch {
             val started = withContext(Dispatchers.IO) {
-                daemonOps.withLock { runCatching { daemon.ensureRunning() }.getOrDefault(false) }
+                daemonOps.withLock {
+                    if (recordingPaused) {
+                        // The user paused while this start was queued: undo it instead of sampling.
+                        runCatching { daemon.stop() }
+                        false
+                    } else {
+                        runCatching { daemon.ensureRunning() }.getOrDefault(false)
+                    }
+                }
             }
             lastDaemonProbeAt = System.currentTimeMillis()
-            daemonState = if (started) DaemonState.RUNNING else DaemonState.STOPPED
+            // A pause that landed while the start was awaiting the mutex wins: never claim "running".
+            daemonState = if (started && !recordingPaused) DaemonState.RUNNING else DaemonState.STOPPED
             android.util.Log.d("BatteryDaemon", "ensureRunning($reason): running=$started")
             if (started) requestDaemonIngest()
             publish()
@@ -1253,18 +1364,28 @@ class PowerStatsRepository(context: Context) {
 
     /** Single restart path for the manual action and the heartbeat watchdog. */
     private fun restartDaemonInternal(reason: String, showUi: Boolean = false) {
+        // A paused app has no sampler to restart; the pause banner owns the only control.
+        if (recordingPaused) return
         if (daemonRestartJob?.isActive == true) return
         daemonRestartJob = scope.launch {
             daemonRestartInFlight = true
             if (showUi) _state.update { it.copy(daemonRestarting = true) }
 
             val started = withContext(Dispatchers.IO) {
-                daemonOps.withLock { runCatching { daemon.restart() }.getOrDefault(false) }
+                daemonOps.withLock {
+                    if (recordingPaused) {
+                        // A pause landed while this restart was queued: never leave a sampler behind.
+                        runCatching { daemon.stop() }
+                        false
+                    } else {
+                        runCatching { daemon.restart() }.getOrDefault(false)
+                    }
+                }
             }
             val now = System.currentTimeMillis()
             lastDaemonStartAttemptAt = now
             lastDaemonProbeAt = now
-            daemonState = if (started) DaemonState.RUNNING else DaemonState.STOPPED
+            daemonState = if (started && !recordingPaused) DaemonState.RUNNING else DaemonState.STOPPED
             if (started) {
                 lastDaemonHeartbeatMillis = 0L
                 daemonHeartbeatStuckAt = 0L
@@ -1278,8 +1399,54 @@ class PowerStatsRepository(context: Context) {
         }
     }
 
+    /**
+     * Enforces a pause that was persisted by a previous process.
+     *
+     * The flag survives process death, but a sampler started before the pause (or by an older
+     * build) may still be alive; stopping it keeps "paused means nothing is written" true.
+     */
+    private fun stopSamplerWhilePaused() {
+        if (daemonPauseEnforceJob?.isActive == true) return
+        daemonPauseEnforceJob = scope.launch {
+            val stopped = withContext(Dispatchers.IO) {
+                daemonOps.withLock {
+                    // The user may have resumed while this job was starting: a sampler the resume
+                    // just brought up must not be killed by a stale pause enforcement.
+                    if (!recordingPaused) null else runCatching { daemon.stop() }.getOrDefault(false)
+                }
+            } ?: return@launch
+            lastDaemonProbeAt = System.currentTimeMillis()
+            daemonState = if (stopped) DaemonState.STOPPED else DaemonState.UNKNOWN
+            publish()
+        }
+    }
+
+    /**
+     * Drops whatever the sampler wrote during the pause and starts a fresh one.
+     *
+     * Runs on the IO dispatcher with [daemonOps] held. The log offset moves to the end of
+     * `samples.log` *before* the new sampler starts, so anything that slipped into the log while
+     * recording was paused (a sampler that refused to die, an older build) can never be folded
+     * into the session when the backlog is ingested.
+     */
+    private fun resumeSampler(): Boolean {
+        val offset = daemon.currentSize()
+        daemonOffset = offset
+        store.saveDaemonOffset(offset)
+        // Daemon timestamps are epoch seconds (`seconds * 1000`), so `now` as a floor would discard
+        // the first post-resume sample whenever it lands in the same wall-clock second as the
+        // resume. One second of slack keeps that sample while still suppressing anything older.
+        val now = System.currentTimeMillis()
+        lastDaemonSampleAt = now - 1_000L
+        store.saveDaemonLastSample(lastDaemonSampleAt)
+        return daemon.ensureRunning()
+    }
+
     /** Reads the samples the daemon wrote since the last ingest and folds them into the session. */
     private fun requestDaemonIngest() {
+        // Never ingest while paused: the sampler is supposed to be silent, and any sample that did
+        // get written must not reach the session (the offset is dropped on resume).
+        if (recordingPaused) return
         if (!daemonActive) return
         if (daemonIngestJob?.isActive == true) return
         daemonIngestJob = scope.launch {
@@ -1496,6 +1663,9 @@ class PowerStatsRepository(context: Context) {
             clearUnavailableData()
             return
         }
+        // Recording paused: no new sample can appear, so neither attribution nor the learned
+        // capacity can change — skip the expensive `dumpsys batterystats` round-trips entirely.
+        if (recordingPaused) return
 
         val fetchedAt = System.currentTimeMillis()
         val historyDue = isHistoryDue(fetchedAt)
@@ -1723,6 +1893,8 @@ class PowerStatsRepository(context: Context) {
                 rootProviderLabel = rootProviderLabel,
                 daemonState = daemonState,
                 daemonRestarting = daemonRestartInFlight,
+                recordingPaused = recordingPaused,
+                recordingPauseBusy = recordingPauseBusy,
             )
         }
     }

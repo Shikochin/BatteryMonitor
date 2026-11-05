@@ -43,7 +43,14 @@ internal class SessionStore(context: Context) {
     init {
         // Bump the version when the encoding changes so stale blobs are dropped instead of parsed.
         if (prefs.getInt(KEY_VERSION, 0) != STORE_VERSION) {
-            prefs.edit().clear().putInt(KEY_VERSION, STORE_VERSION).apply()
+            // The pause flag is a user preference, not session data: a store upgrade must never
+            // silently turn recording back on, so it is carried across the wipe.
+            val recordingPaused = prefs.getBoolean(KEY_RECORDING_PAUSED, false)
+            prefs.edit()
+                .clear()
+                .putInt(KEY_VERSION, STORE_VERSION)
+                .putBoolean(KEY_RECORDING_PAUSED, recordingPaused)
+                .apply()
         }
     }
 
@@ -171,6 +178,26 @@ internal class SessionStore(context: Context) {
 
     fun saveDaemonLastSample(timestampMillis: Long) {
         prefs.edit().putLong(KEY_DAEMON_LAST_SAMPLE, timestampMillis).apply()
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Recording pause (a user preference, not session data: "clear data" keeps it)
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * `true` while the user has paused recording.
+     *
+     * Persisted because a pause must survive the app being killed and the phone rebooting: the
+     * watchdog job reads this flag before it revives the sampler, and the repository restores it
+     * on start-up instead of silently recording again.
+     */
+    fun loadRecordingPaused(): Boolean = prefs.getBoolean(KEY_RECORDING_PAUSED, false)
+
+    fun saveRecordingPaused(paused: Boolean) {
+        // `commit`, not `apply`: this flag is the only thing that stops the watchdog from reviving
+        // the sampler, so it must be on disk before the user can kill the app. One small write on
+        // a rare user action is worth the strictly synchronous guarantee.
+        prefs.edit().putBoolean(KEY_RECORDING_PAUSED, paused).commit()
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -318,6 +345,9 @@ internal class SessionStore(context: Context) {
         const val KEY_HISTORY = "history"
         const val KEY_DAEMON_OFFSET = "daemon_offset"
         const val KEY_DAEMON_LAST_SAMPLE = "daemon_last_sample"
+
+        /** Not part of [STORE_VERSION]: older builds simply ignore the key. */
+        const val KEY_RECORDING_PAUSED = "recording_paused"
 
         const val ENTRY_SEPARATOR = ";"
         const val FIELD_SEPARATOR = ","

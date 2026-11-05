@@ -11,6 +11,12 @@
     <string name="action_restarting">重新啟動中…</string>
     <string name="action_close">關閉</string>
 
+    <!-- 記錄暫停 -->
+    <string name="action_pause_recording">暫停記錄</string>
+    <string name="action_resume_recording">繼續記錄</string>
+    <string name="recording_paused_title">已暫停記錄</string>
+    <string name="recording_paused_hint">暫停期間不記錄任何資料，圖表中該時段顯示為虛線，也不計入使用時間與功耗統計。</string>
+
     <!-- 下拉重新整理 -->
     <string name="pull_to_refresh">下拉重新整理</string>
     <string name="release_to_refresh">放開重新整理</string>
@@ -30,6 +36,7 @@
     <string name="daemon_running">執行中</string>
     <string name="daemon_stopped">未執行</string>
     <string name="daemon_unknown">狀態未知</string>
+    <string name="daemon_paused">已暫停</string>
     <string name="data_source_line">資料來源：%1$s · 守護程序%2$s</string>
 
     <!-- 卡片標題 -->
@@ -54,7 +61,7 @@
     <string name="legend_missed_screen_on">螢幕亮起，未記錄電池狀態</string>
     <string name="legend_missed_screen_off">螢幕關閉，未記錄電池狀態</string>
     <string name="legend_hint_screen_off">手機螢幕關閉時，本應用程式會停止記錄電池狀態以減少耗電，在圖表中顯示為灰色虛線。</string>
-    <string name="legend_hint_missed">但若圖表中出現藍色虛線，表示背景程序被休眠，未能按預定頻率記錄電池狀態。</string>
+    <string name="legend_hint_missed">藍色虛線表示背景程序被暫停、沒能按計畫記錄電池狀態——或者你主動暫停了記錄。</string>
     <string name="legend_got_it">我知道了</string>
 
     <!-- 歷史記錄 -->

@@ -26,6 +26,9 @@ class MainActivity : ComponentActivity() {
                     onClearData = { viewModel.clearSessionData() },
                     onRefreshScenarios = { viewModel.refreshScenarios() },
                     onRestartDaemon = { viewModel.restartDaemon() },
+                    // The screen owns neither the paused flag nor the call that flips it: it only
+                    // reports the desired direction, and the repository settles the sampler.
+                    onToggleRecordingPause = { viewModel.setRecordingPaused(!state.recordingPaused) },
                     onRequestShizuku = { viewModel.requestShizukuPermission() },
                     onDeleteHistory = { startedAtMillis -> viewModel.deleteSessionRecord(startedAtMillis) },
                     onClearHistory = { viewModel.clearSessionHistory() },

@@ -29,6 +29,14 @@ class PowerStatsViewModel(application: Application) : AndroidViewModel(applicati
     /** Kills any running root sampler and starts a fresh one. */
     fun restartDaemon() = repository.restartDaemon()
 
+    /**
+     * Pauses (`true`) or resumes (`false`) recording.
+     *
+     * While paused the detached sampler is stopped, so nothing is appended to the sample log and
+     * the paused stretch shows up as an unrecorded (dashed) segment on the curve.
+     */
+    fun setRecordingPaused(paused: Boolean) = repository.setRecordingPaused(paused)
+
     fun clearSessionData() = repository.clearSessionData()
 
     /** Asks the Shizuku service for shell access so we can read `dumpsys batterystats`. */

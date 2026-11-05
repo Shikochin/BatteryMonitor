@@ -56,9 +56,20 @@ class DaemonWatchdogService : JobService() {
 
     override fun onStartJob(params: JobParameters?): Boolean {
         scope.launch {
-            val running = runCatching { RootMonitorDaemon(applicationContext).ensureRunning() }
+            // A user who paused recording stays paused across reboots: the flag is persisted, so
+            // the watchdog never revives the sampler behind the user's back (and reaps one that
+            // outlived the pause, e.g. a sampler started by an older build before the flag was set).
+            val paused = runCatching { SessionStore(applicationContext).loadRecordingPaused() }
                 .getOrDefault(false)
-            Log.d("BatteryDaemon", "watchdog: running=$running")
+            if (paused) {
+                val stopped = runCatching { RootMonitorDaemon(applicationContext).stop() }
+                    .getOrDefault(false)
+                Log.d("BatteryDaemon", "watchdog: recording paused, stopped=$stopped")
+            } else {
+                val running = runCatching { RootMonitorDaemon(applicationContext).ensureRunning() }
+                    .getOrDefault(false)
+                Log.d("BatteryDaemon", "watchdog: running=$running")
+            }
             jobFinished(params, false)
         }
         return true
