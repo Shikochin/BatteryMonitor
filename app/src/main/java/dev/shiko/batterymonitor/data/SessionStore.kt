@@ -11,10 +11,20 @@ internal data class StoredSession(
     val startMillis: Long,
     val startLevelPercent: Int?,
     val sampleCount: Int,
-    /** Σ(current_mA × voltage_V) in mW. */
+    /** Legacy unweighted sum, retained to migrate existing sessions. */
     val powerMilliWattSum: Double,
+    val usedMillis: Long,
+    /** Σ(power_mW × elapsed_ms), signed negative while discharging. */
+    val weightedPowerMilliWattMillisSum: Double,
+    val screenOnUsedMillis: Long,
+    val screenOnWeightedPowerMilliWattMillisSum: Double,
+    val screenOffUsedMillis: Long,
+    val screenOffWeightedPowerMilliWattMillisSum: Double,
     val lastSampleAtMillis: Long,
     val lastSampleLevel: Int,
+    val lastSamplePowerMilliWatts: Float,
+    val lastSampleWasScreenOn: Boolean,
+    val lastSampleWasDischarging: Boolean,
     val packages: Map<String, PackageAggregate>,
 )
 
@@ -62,13 +72,37 @@ internal class SessionStore(context: Context) {
     fun loadSession(): StoredSession? {
         val start = prefs.getLong(KEY_SESSION_START, NO_VALUE)
         if (start <= 0L) return null
+        val sampleCount = prefs.getInt(KEY_SAMPLE_COUNT, 0)
+        val powerSum = prefs.getLong(KEY_POWER_SUM, 0L).toDouble()
+        val usedMillis = prefs.getLong(KEY_USED_MILLIS, NO_VALUE)
+            .takeIf { it >= 0L } ?: sampleCount.toLong() * PowerMath.TICK_INTERVAL_MILLIS
+        val weightedPowerSum = prefs.getLong(KEY_WEIGHTED_POWER_SUM, NO_VALUE)
+            .takeIf { it != NO_VALUE }?.toDouble()
+            ?: powerSum * PowerMath.TICK_INTERVAL_MILLIS
+        val screenOnUsedMillis = prefs.getLong(KEY_SCREEN_ON_USED_MILLIS, NO_VALUE)
+            .takeIf { it >= 0L } ?: (sampleCount.toLong() * PowerMath.TICK_INTERVAL_MILLIS)
+        val screenOffUsedMillis = prefs.getLong(KEY_SCREEN_OFF_USED_MILLIS, NO_VALUE)
+            .takeIf { it >= 0L } ?: (usedMillis - screenOnUsedMillis).coerceAtLeast(0L)
+        val screenOnWeightedPowerSum = prefs.getLong(KEY_SCREEN_ON_WEIGHTED_POWER_SUM, NO_VALUE)
+            .takeIf { it != NO_VALUE }?.toDouble() ?: powerSum * PowerMath.TICK_INTERVAL_MILLIS
+        val screenOffWeightedPowerSum = prefs.getLong(KEY_SCREEN_OFF_WEIGHTED_POWER_SUM, NO_VALUE)
+            .takeIf { it != NO_VALUE }?.toDouble() ?: weightedPowerSum - screenOnWeightedPowerSum
         return StoredSession(
             startMillis = start,
             startLevelPercent = prefs.getInt(KEY_START_LEVEL, NO_VALUE.toInt()).takeIf { it in 0..100 },
-            sampleCount = prefs.getInt(KEY_SAMPLE_COUNT, 0),
-            powerMilliWattSum = prefs.getLong(KEY_POWER_SUM, 0L).toDouble(),
+            sampleCount = sampleCount,
+            powerMilliWattSum = powerSum,
+            usedMillis = usedMillis,
+            weightedPowerMilliWattMillisSum = weightedPowerSum,
+            screenOnUsedMillis = screenOnUsedMillis,
+            screenOnWeightedPowerMilliWattMillisSum = screenOnWeightedPowerSum,
+            screenOffUsedMillis = screenOffUsedMillis,
+            screenOffWeightedPowerMilliWattMillisSum = screenOffWeightedPowerSum,
             lastSampleAtMillis = prefs.getLong(KEY_LAST_SAMPLE_AT, 0L),
             lastSampleLevel = prefs.getInt(KEY_LAST_SAMPLE_LEVEL, -1),
+            lastSamplePowerMilliWatts = prefs.getLong(KEY_LAST_SAMPLE_POWER, 0L).toFloat(),
+            lastSampleWasScreenOn = prefs.getBoolean(KEY_LAST_SAMPLE_SCREEN_ON, false),
+            lastSampleWasDischarging = prefs.getBoolean(KEY_LAST_SAMPLE_DISCHARGING, false),
             packages = AggregateCodec.decode(prefs.getString(KEY_PACKAGES, null)),
         )
     }
@@ -81,8 +115,17 @@ internal class SessionStore(context: Context) {
                 .remove(KEY_START_LEVEL)
                 .remove(KEY_SAMPLE_COUNT)
                 .remove(KEY_POWER_SUM)
+                .remove(KEY_USED_MILLIS)
+                .remove(KEY_WEIGHTED_POWER_SUM)
+                .remove(KEY_SCREEN_ON_USED_MILLIS)
+                .remove(KEY_SCREEN_ON_WEIGHTED_POWER_SUM)
+                .remove(KEY_SCREEN_OFF_USED_MILLIS)
+                .remove(KEY_SCREEN_OFF_WEIGHTED_POWER_SUM)
                 .remove(KEY_LAST_SAMPLE_AT)
                 .remove(KEY_LAST_SAMPLE_LEVEL)
+                .remove(KEY_LAST_SAMPLE_POWER)
+                .remove(KEY_LAST_SAMPLE_SCREEN_ON)
+                .remove(KEY_LAST_SAMPLE_DISCHARGING)
                 .remove(KEY_PACKAGES)
                 .apply()
             return
@@ -91,8 +134,17 @@ internal class SessionStore(context: Context) {
             .putLong(KEY_SESSION_START, session.startMillis)
             .putInt(KEY_SAMPLE_COUNT, session.sampleCount)
             .putLong(KEY_POWER_SUM, session.powerMilliWattSum.toLong())
+            .putLong(KEY_USED_MILLIS, session.usedMillis)
+            .putLong(KEY_WEIGHTED_POWER_SUM, session.weightedPowerMilliWattMillisSum.toLong())
+            .putLong(KEY_SCREEN_ON_USED_MILLIS, session.screenOnUsedMillis)
+            .putLong(KEY_SCREEN_ON_WEIGHTED_POWER_SUM, session.screenOnWeightedPowerMilliWattMillisSum.toLong())
+            .putLong(KEY_SCREEN_OFF_USED_MILLIS, session.screenOffUsedMillis)
+            .putLong(KEY_SCREEN_OFF_WEIGHTED_POWER_SUM, session.screenOffWeightedPowerMilliWattMillisSum.toLong())
             .putLong(KEY_LAST_SAMPLE_AT, session.lastSampleAtMillis)
             .putInt(KEY_LAST_SAMPLE_LEVEL, session.lastSampleLevel)
+            .putLong(KEY_LAST_SAMPLE_POWER, session.lastSamplePowerMilliWatts.toLong())
+            .putBoolean(KEY_LAST_SAMPLE_SCREEN_ON, session.lastSampleWasScreenOn)
+            .putBoolean(KEY_LAST_SAMPLE_DISCHARGING, session.lastSampleWasDischarging)
             .apply()
         session.startLevelPercent?.let { editor.putInt(KEY_START_LEVEL, it) }
         if (session.packages.isEmpty()) {
@@ -147,8 +199,17 @@ internal class SessionStore(context: Context) {
             .remove(KEY_START_LEVEL)
             .remove(KEY_SAMPLE_COUNT)
             .remove(KEY_POWER_SUM)
+            .remove(KEY_USED_MILLIS)
+            .remove(KEY_WEIGHTED_POWER_SUM)
+            .remove(KEY_SCREEN_ON_USED_MILLIS)
+            .remove(KEY_SCREEN_ON_WEIGHTED_POWER_SUM)
+            .remove(KEY_SCREEN_OFF_USED_MILLIS)
+            .remove(KEY_SCREEN_OFF_WEIGHTED_POWER_SUM)
             .remove(KEY_LAST_SAMPLE_AT)
             .remove(KEY_LAST_SAMPLE_LEVEL)
+            .remove(KEY_LAST_SAMPLE_POWER)
+            .remove(KEY_LAST_SAMPLE_SCREEN_ON)
+            .remove(KEY_LAST_SAMPLE_DISCHARGING)
             .remove(KEY_PACKAGES)
             .apply()
     }
@@ -242,8 +303,17 @@ internal class SessionStore(context: Context) {
         const val KEY_START_LEVEL = "start_level"
         const val KEY_SAMPLE_COUNT = "sample_count"
         const val KEY_POWER_SUM = "power_sum"
+        const val KEY_USED_MILLIS = "used_millis"
+        const val KEY_WEIGHTED_POWER_SUM = "weighted_power_sum"
+        const val KEY_SCREEN_ON_USED_MILLIS = "screen_on_used_millis"
+        const val KEY_SCREEN_ON_WEIGHTED_POWER_SUM = "screen_on_weighted_power_sum"
+        const val KEY_SCREEN_OFF_USED_MILLIS = "screen_off_used_millis"
+        const val KEY_SCREEN_OFF_WEIGHTED_POWER_SUM = "screen_off_weighted_power_sum"
         const val KEY_LAST_SAMPLE_AT = "last_sample_at"
         const val KEY_LAST_SAMPLE_LEVEL = "last_sample_level"
+        const val KEY_LAST_SAMPLE_POWER = "last_sample_power"
+        const val KEY_LAST_SAMPLE_SCREEN_ON = "last_sample_screen_on"
+        const val KEY_LAST_SAMPLE_DISCHARGING = "last_sample_discharging"
         const val KEY_PACKAGES = "packages"
         const val KEY_HISTORY = "history"
         const val KEY_DAEMON_OFFSET = "daemon_offset"

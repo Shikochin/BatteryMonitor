@@ -40,6 +40,12 @@
     <string name="summary_average_power">平均功耗</string>
     <string name="summary_used">已使用</string>
     <string name="summary_estimated_runtime">理論續航</string>
+    <string name="summary_screen_on_average_power">亮屏平均功耗</string>
+    <string name="summary_screen_off_average_power">熄屏平均功耗</string>
+    <string name="summary_screen_on_time">亮屏時間</string>
+    <string name="summary_screen_off_time">熄屏時間</string>
+    <string name="summary_screen_on_estimated_runtime">亮屏理論續航</string>
+    <string name="summary_screen_off_estimated_runtime">熄屏理論續航</string>
 
     <!-- 圖例 -->
     <string name="legend_title">說明提示</string>

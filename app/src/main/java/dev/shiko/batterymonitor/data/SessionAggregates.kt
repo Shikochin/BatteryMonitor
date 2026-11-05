@@ -4,8 +4,9 @@ package dev.shiko.batterymonitor.data
  * Running per-package aggregates for the current session (Scene's `group by package` query, done
  * incrementally instead of over a database).
  *
- * Only screen-on, discharging samples are folded in, so `sampleCount × 3 s` is the app's usage
- * duration and the means match Scene's `avg(current × voltage)` / `avg(temperature)`.
+ * Only screen-on, discharging samples are folded in, so `sampleCount × 3 s` is each app's usage
+ * duration and the means match Scene's `avg(current × voltage)` / `avg(temperature)`. Whole-session
+ * usage and power are tracked separately and include lower-frequency screen-off samples.
  */
 internal data class PackageAggregate(
     val sampleCount: Int = 0,

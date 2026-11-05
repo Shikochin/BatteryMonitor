@@ -193,6 +193,12 @@ fun PowerStatsScreen(
                     )
                     StatSummaryCard(
                         summary = state.summary,
+                        screenOn = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    StatSummaryCard(
+                        summary = state.screenOffSummary,
+                        screenOn = false,
                         modifier = Modifier.fillMaxWidth(),
                     )
                     UsageScenarioCard(

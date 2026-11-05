@@ -24,7 +24,7 @@ import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
- * Card 2 — the three-column summary: 平均功耗 / 已使用 / 理论续航.
+ * Three-column summary for either screen-on or screen-off discharge.
  *
  * One [Card] holding a single row of three equal-width columns, mirroring the Scene reference:
  * a large blue value stacked on top of a small grey label.
@@ -32,30 +32,37 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 @Composable
 fun StatSummaryCard(
     summary: PowerSummary,
+    screenOn: Boolean,
     modifier: Modifier = Modifier,
 ) {
     Card(modifier = modifier) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            SummaryColumn(
-                value = formatWatts(summary.averagePowerWatts),
-                label = stringResource(R.string.summary_average_power),
-                modifier = Modifier.weight(1f),
-            )
-            SummaryColumn(
-                value = formatDuration(summary.usedMillis),
-                label = stringResource(R.string.summary_used),
-                modifier = Modifier.weight(1f),
-            )
-            SummaryColumn(
-                value = formatDuration(summary.estimatedRuntimeMillis),
-                label = stringResource(R.string.summary_estimated_runtime),
-                modifier = Modifier.weight(1f),
-            )
+        Column(modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                SummaryColumn(
+                    value = formatWatts(summary.averagePowerWatts),
+                    label = stringResource(
+                        if (screenOn) R.string.summary_screen_on_average_power
+                        else R.string.summary_screen_off_average_power,
+                    ),
+                    modifier = Modifier.weight(1f),
+                )
+                SummaryColumn(
+                    value = formatDuration(summary.usedMillis),
+                    label = stringResource(if (screenOn) R.string.summary_screen_on_time else R.string.summary_screen_off_time),
+                    modifier = Modifier.weight(1f),
+                )
+                SummaryColumn(
+                    value = formatDuration(summary.estimatedRuntimeMillis),
+                    label = stringResource(
+                        if (screenOn) R.string.summary_screen_on_estimated_runtime
+                        else R.string.summary_screen_off_estimated_runtime,
+                    ),
+                    modifier = Modifier.weight(1f),
+                )
+            }
         }
     }
 }

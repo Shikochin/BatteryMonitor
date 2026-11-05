@@ -40,6 +40,12 @@
     <string name="summary_average_power">平均消費電力</string>
     <string name="summary_used">使用時間</string>
     <string name="summary_estimated_runtime">推定駆動時間</string>
+    <string name="summary_screen_on_average_power">画面オン平均消費電力</string>
+    <string name="summary_screen_off_average_power">画面オフ平均消費電力</string>
+    <string name="summary_screen_on_time">画面オン時間</string>
+    <string name="summary_screen_off_time">画面オフ時間</string>
+    <string name="summary_screen_on_estimated_runtime">画面オン推定駆動時間</string>
+    <string name="summary_screen_off_estimated_runtime">画面オフ推定駆動時間</string>
 
     <!-- 凡例 -->
     <string name="legend_title">説明</string>

@@ -35,11 +35,9 @@ import kotlin.math.abs
  *
  * The maths are aligned with Scene 9.4.18 (`Analyser-Power` + its SQL queries):
  *
- *  - a sample is recorded **only while discharging and the screen is on** (plus one final
- *    `screenOn = false` record when the screen turns off, which is what draws the grey chart
- *    segment); charging periods record nothing,
- *  - `平均功耗` = mean of `current(mA) × voltage(V)` over the session's screen-on samples,
- *  - `已使用` = `sampleCount × 3 s`,
+ *  - battery/chart samples are recorded every 3 s throughout discharge; charging periods record nothing,
+ *  - on-screen and screen-off power/time summaries are tracked separately,
+ *  - each usage duration is elapsed discharging time in that screen state,
  *  - `理论续航` = `remainingWh / avgPower × 0.9`,
  *  - `使用场景` = the same samples grouped per foreground package (no UID/whole-device fallback),
  *  - the chart breaks into dotted segments when the gap between samples exceeds 10 s.
@@ -79,11 +77,20 @@ class PowerStatsRepository(context: Context) {
 
     /** Σ(current_mA × voltage_V) in mW over those samples (negative while discharging). */
     private var sessionPowerMilliWattSum: Double = 0.0
+    private var sessionUsedMillis: Long = 0L
+    /** Σ(power_mW × elapsed_ms), negative while discharging. */
+    private var sessionWeightedPowerMilliWattMillisSum: Double = 0.0
+    private var screenOnUsedMillis: Long = 0L
+    private var screenOnWeightedPowerMilliWattMillisSum: Double = 0.0
+    private var screenOffUsedMillis: Long = 0L
+    private var screenOffWeightedPowerMilliWattMillisSum: Double = 0.0
     private val packageAggregates = LinkedHashMap<String, PackageAggregate>()
 
     private var lastSampleAtMillis: Long = 0L
     private var lastSampleLevel: Int = -1
     private var lastSampleWasScreenOn: Boolean = false
+    private var lastSampleWasDischarging: Boolean = false
+    private var lastSamplePowerMilliWatts: Float = 0f
 
     // --- live reading ------------------------------------------------------------------------------
     private var lastReading: BatteryReading? = null
@@ -314,6 +321,7 @@ class PowerStatsRepository(context: Context) {
             it.copy(
                 snapshot = null,
                 summary = PowerSummary(0f, 0L, 0L),
+                screenOffSummary = PowerSummary(0f, 0L, 0L),
                 chartSamples = emptyList(),
                 scenarios = emptyList(),
                 loadingScenarios = true,
@@ -443,6 +451,7 @@ class PowerStatsRepository(context: Context) {
             it.copy(
                 snapshot = null,
                 summary = PowerSummary(0f, 0L, 0L),
+                screenOffSummary = PowerSummary(0f, 0L, 0L),
                 scenarios = emptyList(),
                 loadingScenarios = false,
             )
@@ -678,6 +687,12 @@ class PowerStatsRepository(context: Context) {
         val reference = updateCounterReference(raw, now)
         val reading = calibrateReading(raw, reference)
         if (reading == null) {
+            if (!raw.discharging) {
+                accumulateDischargeUntil(now, maxElapsedMillis = PowerMath.TICK_INTERVAL_MILLIS)
+                lastSampleWasScreenOn = false
+                lastSampleWasDischarging = false
+                persistSessionIfDue(now)
+            }
             // No trustworthy current yet (right after start-up): keep the last power, do not sample.
             lastSnapshot = buildSnapshot(
                 raw = raw,
@@ -737,9 +752,8 @@ class PowerStatsRepository(context: Context) {
     // =============================================================================================
 
     /**
-     * Records a sample only while discharging and the screen is on. When the screen turns off one
-     * final `screenOn = false` sample is stored (that is Scene's grey chart segment); charging
-     * periods record nothing at all.
+     * Records battery and chart samples throughout discharge. Package aggregates remain
+     * screen-on only; charging periods do not contribute to discharge time or average power.
      */
     private fun handleSampling(
         reading: BatteryReading,
@@ -748,19 +762,35 @@ class PowerStatsRepository(context: Context) {
         attributedPackage: String? = null,
     ) {
         when {
-            reading.charging -> lastSampleWasScreenOn = false
+            reading.charging -> {
+                accumulateDischargeUntil(
+                    nowMillis,
+                    maxElapsedMillis = PowerMath.TICK_INTERVAL_MILLIS,
+                )
+                lastSampleWasScreenOn = false
+                lastSampleWasDischarging = false
+                persistSessionIfDue(nowMillis)
+            }
 
             reading.discharging && screenOn ->
                 recordSample(reading, screenOn = true, nowMillis = nowMillis, attributedPackage = attributedPackage)
 
             reading.discharging && !screenOn -> {
-                if (lastSampleWasScreenOn) {
-                    recordSample(reading, screenOn = false, nowMillis = nowMillis, attributedPackage = attributedPackage)
-                }
-                lastSampleWasScreenOn = false
+                val screenOffSampleDue = !lastSampleWasDischarging ||
+                    nowMillis - lastSampleAtMillis >= PowerMath.SCREEN_OFF_TICK_INTERVAL_MILLIS
+                if (screenOffSampleDue) recordSample(reading, screenOn = false, nowMillis = nowMillis)
             }
 
-            else -> lastSampleWasScreenOn = false
+            else -> {
+                if (lastSampleWasDischarging) {
+                    accumulateDischargeUntil(
+                        nowMillis,
+                        maxElapsedMillis = PowerMath.TICK_INTERVAL_MILLIS,
+                    )
+                }
+                lastSampleWasScreenOn = false
+                lastSampleWasDischarging = false
+            }
         }
     }
 
@@ -773,8 +803,10 @@ class PowerStatsRepository(context: Context) {
         if (sessionStartMillis == null) beginSession(reading.levelPercent)
         if (shouldStartNewSession(reading, nowMillis)) beginNewSession(reading.levelPercent)
 
+        val powerMilliWatts = reading.currentMilliAmps * reading.voltageVolts
+        accumulateDischargeUntil(nowMillis)
+
         if (screenOn) {
-            val powerMilliWatts = reading.currentMilliAmps * reading.voltageVolts
             sessionSampleCount++
             sessionPowerMilliWattSum += powerMilliWatts
             // Scene's SQL only filters `package != ''`, so our own package is listed too.
@@ -796,7 +828,24 @@ class PowerStatsRepository(context: Context) {
         lastSampleAtMillis = nowMillis
         lastSampleLevel = reading.levelPercent
         lastSampleWasScreenOn = screenOn
+        lastSampleWasDischarging = true
+        lastSamplePowerMilliWatts = powerMilliWatts
         persistSessionIfDue(nowMillis)
+    }
+
+    private fun accumulateDischargeUntil(nowMillis: Long, maxElapsedMillis: Long? = null) {
+        if (!lastSampleWasDischarging || lastSampleAtMillis <= 0L) return
+        val elapsedMillis = (nowMillis - lastSampleAtMillis).coerceAtLeast(0L)
+            .let { maxElapsedMillis?.let(it::coerceAtMost) ?: it }
+        sessionUsedMillis += elapsedMillis
+        sessionWeightedPowerMilliWattMillisSum += lastSamplePowerMilliWatts * elapsedMillis
+        if (lastSampleWasScreenOn) {
+            screenOnUsedMillis += elapsedMillis
+            screenOnWeightedPowerMilliWattMillisSum += lastSamplePowerMilliWatts * elapsedMillis
+        } else {
+            screenOffUsedMillis += elapsedMillis
+            screenOffWeightedPowerMilliWattMillisSum += lastSamplePowerMilliWatts * elapsedMillis
+        }
     }
 
     /**
@@ -823,16 +872,14 @@ class PowerStatsRepository(context: Context) {
     // Chart
     // =============================================================================================
 
-    /** Appends one chart point; gaps over 10 s become the dotted `MissedRecord*` variants. */
+    /** Appends a raw chart point; interval styles are derived from adjacent timestamps below. */
     private fun appendChartPoint(
         reading: BatteryReading,
         screenOn: Boolean,
         nowMillis: Long,
         packageName: String? = null,
     ) {
-        val previous = lastChartPointAtMillis
-        val missed = previous > 0L && PowerMath.isMissedRecord(nowMillis - previous)
-        val style = PowerMath.segmentStyle(screenOn, missed)
+        val style = PowerMath.segmentStyle(screenOn, missedRecord = false)
         windowSamples.add(
             PowerSample(
                 timestampMillis = nowMillis,
@@ -887,13 +934,15 @@ class PowerStatsRepository(context: Context) {
     }
 
     private fun rebuildChartSamples() {
-        chartSamples = windowSamples.map {
+        chartSamples = windowSamples.mapIndexed { index, sample ->
+            val next = windowSamples.getOrNull(index + 1)
+            val missed = next != null && PowerMath.isMissedRecord(next.timestampMillis - sample.timestampMillis)
             ChartSample(
-                timestampMillis = it.timestampMillis,
-                levelPercent = it.levelPercent,
-                style = it.style,
-                packageName = it.packageName,
-                powerMilliWatts = it.powerMilliWatts,
+                timestampMillis = sample.timestampMillis,
+                levelPercent = sample.levelPercent,
+                style = PowerMath.segmentStyle(sample.screenOn, missed),
+                packageName = sample.packageName,
+                powerMilliWatts = sample.powerMilliWatts,
             )
         }
     }
@@ -904,19 +953,15 @@ class PowerStatsRepository(context: Context) {
     ): List<ChartSample> {
         if (points.isEmpty()) return emptyList()
         val samples = ArrayList<ChartSample>(points.size)
-        var previousTimestamp = 0L
-        for (point in points) {
-            val missed = previousTimestamp > 0L &&
-                PowerMath.isMissedRecord(
-                    point.timestampMillis - previousTimestamp,
-                    PowerMath.HISTORY_MISSED_GAP_MILLIS,
-                )
+        for ((index, point) in points.withIndex()) {
+            val next = points.getOrNull(index + 1)
+            val missed = next != null &&
+                PowerMath.isMissedRecord(next.timestampMillis - point.timestampMillis, PowerMath.HISTORY_MISSED_GAP_MILLIS)
             samples += ChartSample(
                 timestampMillis = point.timestampMillis,
                 levelPercent = point.levelPercent,
                 style = PowerMath.segmentStyle(point.screenOn, missed),
             )
-            previousTimestamp = point.timestampMillis
         }
         return samples
     }
@@ -937,12 +982,19 @@ class PowerStatsRepository(context: Context) {
     // Summary / capacity
     // =============================================================================================
 
-    private fun currentSummary(): PowerSummary {
-        if (!shizukuGranted || sessionSampleCount <= 0) return PowerSummary(0f, 0L, 0L)
-        val averagePowerWatts = (-sessionPowerMilliWattSum / sessionSampleCount / 1000.0)
-            .toFloat()
-            .takeIf { it.isFinite() } ?: 0f
-        val usedMillis = sessionSampleCount.toLong() * PowerMath.TICK_INTERVAL_MILLIS
+    private fun currentSummary(screenOn: Boolean): PowerSummary {
+        if (!shizukuGranted) return PowerSummary(0f, 0L, 0L)
+        val projectedMillis = if (
+            lastSampleWasDischarging && lastSampleWasScreenOn == screenOn && lastSampleAtMillis > 0L
+        ) {
+            (System.currentTimeMillis() - lastSampleAtMillis).coerceAtLeast(0L)
+        } else {
+            0L
+        }
+        val usedMillis = (if (screenOn) screenOnUsedMillis else screenOffUsedMillis) + projectedMillis
+        val weightedPowerSum = (if (screenOn) screenOnWeightedPowerMilliWattMillisSum
+        else screenOffWeightedPowerMilliWattMillisSum) + lastSamplePowerMilliWatts * projectedMillis
+        val averagePowerWatts = PowerMath.averageDischargePowerWatts(weightedPowerSum, usedMillis)
         return PowerSummary(
             averagePowerWatts = averagePowerWatts,
             usedMillis = usedMillis,
@@ -1262,6 +1314,14 @@ class PowerStatsRepository(context: Context) {
             chargeCounterMicroAmpHours = sample.chargeCounterMicroAmpHours,
             chargeFullMilliAmpHours = sample.chargeFullMilliAmpHours,
         )
+        if (!raw.discharging) {
+            accumulateDischargeUntil(
+                sample.timestampMillis,
+                maxElapsedMillis = PowerMath.TICK_INTERVAL_MILLIS,
+            )
+            lastSampleWasScreenOn = false
+            lastSampleWasDischarging = false
+        }
         val rawCurrent = raw.rawCurrent ?: return
         val calibration = CurrentCalibrator.calibrate(
             rawCurrent = rawCurrent,
@@ -1510,6 +1570,12 @@ class PowerStatsRepository(context: Context) {
         startLevelPercent = levelPercent
         sessionSampleCount = 0
         sessionPowerMilliWattSum = 0.0
+        sessionUsedMillis = 0L
+        sessionWeightedPowerMilliWattMillisSum = 0.0
+        screenOnUsedMillis = 0L
+        screenOnWeightedPowerMilliWattMillisSum = 0.0
+        screenOffUsedMillis = 0L
+        screenOffWeightedPowerMilliWattMillisSum = 0.0
         packageAggregates.clear()
         windowSamples.clear()
         chartSamples = emptyList()
@@ -1519,6 +1585,8 @@ class PowerStatsRepository(context: Context) {
         lastSampleAtMillis = 0L
         lastSampleLevel = -1
         lastSampleWasScreenOn = false
+        lastSampleWasDischarging = false
+        lastSamplePowerMilliWatts = 0f
         lastSamplesPersistedAtMillis = 0L
         pendingAttribution.clear()
         unattributedSampleSeen = false
@@ -1526,9 +1594,17 @@ class PowerStatsRepository(context: Context) {
 
     private fun archiveCurrentSession(nowMillis: Long, endLevelPercent: Int?) {
         val start = sessionStartMillis ?: return
-        if (sessionSampleCount <= 0) return
-        val averagePowerWatts = (-sessionPowerMilliWattSum / sessionSampleCount / 1000.0).toFloat()
-        val durationMillis = sessionSampleCount.toLong() * PowerMath.TICK_INTERVAL_MILLIS
+        val trailingMillis = if (lastSampleWasDischarging && lastSampleAtMillis > 0L) {
+            (nowMillis - lastSampleAtMillis).coerceIn(0L, SESSION_MAX_GAP_MILLIS)
+        } else {
+            0L
+        }
+        val durationMillis = sessionUsedMillis + trailingMillis
+        if (durationMillis <= 0L) return
+        val averagePowerWatts = PowerMath.averageDischargePowerWatts(
+            sessionWeightedPowerMilliWattMillisSum + lastSamplePowerMilliWatts * trailingMillis,
+            durationMillis,
+        )
         val record = SessionRecord(
             startedAtMillis = start,
             durationMillis = durationMillis,
@@ -1547,9 +1623,18 @@ class PowerStatsRepository(context: Context) {
         startLevelPercent = stored.startLevelPercent
         sessionSampleCount = stored.sampleCount
         sessionPowerMilliWattSum = stored.powerMilliWattSum
+        sessionUsedMillis = stored.usedMillis
+        sessionWeightedPowerMilliWattMillisSum = stored.weightedPowerMilliWattMillisSum
+        screenOnUsedMillis = stored.screenOnUsedMillis
+        screenOnWeightedPowerMilliWattMillisSum = stored.screenOnWeightedPowerMilliWattMillisSum
+        screenOffUsedMillis = stored.screenOffUsedMillis
+        screenOffWeightedPowerMilliWattMillisSum = stored.screenOffWeightedPowerMilliWattMillisSum
         packageAggregates.putAll(stored.packages)
         lastSampleAtMillis = stored.lastSampleAtMillis
         lastSampleLevel = stored.lastSampleLevel
+        lastSamplePowerMilliWatts = stored.lastSamplePowerMilliWatts
+        lastSampleWasScreenOn = stored.lastSampleWasScreenOn
+        lastSampleWasDischarging = stored.lastSampleWasDischarging
 
         val threshold = System.currentTimeMillis() - PowerMath.CHART_RETENTION_MILLIS
         for (sample in store.loadSamples()) {
@@ -1568,8 +1653,17 @@ class PowerStatsRepository(context: Context) {
                     startLevelPercent = startLevelPercent,
                     sampleCount = sessionSampleCount,
                     powerMilliWattSum = sessionPowerMilliWattSum,
+                    usedMillis = sessionUsedMillis,
+                    weightedPowerMilliWattMillisSum = sessionWeightedPowerMilliWattMillisSum,
+                    screenOnUsedMillis = screenOnUsedMillis,
+                    screenOnWeightedPowerMilliWattMillisSum = screenOnWeightedPowerMilliWattMillisSum,
+                    screenOffUsedMillis = screenOffUsedMillis,
+                    screenOffWeightedPowerMilliWattMillisSum = screenOffWeightedPowerMilliWattMillisSum,
                     lastSampleAtMillis = lastSampleAtMillis,
                     lastSampleLevel = lastSampleLevel,
+                    lastSamplePowerMilliWatts = lastSamplePowerMilliWatts,
+                    lastSampleWasScreenOn = lastSampleWasScreenOn,
+                    lastSampleWasDischarging = lastSampleWasDischarging,
                     packages = packageAggregates,
                 )
             },
@@ -1589,12 +1683,14 @@ class PowerStatsRepository(context: Context) {
     // =============================================================================================
 
     private fun publish() {
-        val summary = currentSummary()
+        val summary = currentSummary(screenOn = true)
+        val screenOffSummary = currentSummary(screenOn = false)
         val mergedChartSamples = mergedChartSamples()
         _state.update {
             it.copy(
                 snapshot = lastSnapshot,
                 summary = summary,
+                screenOffSummary = screenOffSummary,
                 chartSamples = mergedChartSamples,
                 chartWindowMillis = PowerMath.CHART_WINDOW_MILLIS,
                 startLevelPercent = startLevelPercent ?: lastSnapshot?.levelPercent ?: it.startLevelPercent,

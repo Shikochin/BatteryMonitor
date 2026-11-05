@@ -426,7 +426,7 @@ internal class RootMonitorDaemon(context: Context) {
         const val STAGED_SCRIPT = "/data/local/tmp/bm-daemon.sh"
 
         /** Must match `VERSION` in `monitor-daemon.sh`; bump both when the script changes. */
-        const val SCRIPT_VERSION = 3
+        const val SCRIPT_VERSION = 4
 
         /** Global lock file: only one sampler may hold it, across app versions and processes. */
         const val LOCK_PATH = "/data/local/tmp/bm-daemon.lock"

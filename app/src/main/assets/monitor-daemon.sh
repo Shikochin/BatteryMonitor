@@ -33,7 +33,7 @@ esac
 # Bump whenever this file changes: the app compares it with the version published in STATE and
 # replaces a daemon left over from an older build (otherwise an app update would keep sampling
 # with the old script until the next reboot).
-VERSION=3
+VERSION=4
 
 # True when $1 is a live sampler. `sh -c` wrappers are excluded because their
 # command text contains this script's name and they must never be killed.
@@ -128,7 +128,7 @@ if ! acquire_lock; then
 fi
 
 screen=0
-interval=15
+interval=3
 MAX_BYTES=4194304
 ROTATE_EVERY=40
 
@@ -208,8 +208,8 @@ while :; do
 
   echo "$now|$screen|$cap|$volt|$cur|$temp|$status|$cc|$fg" >> "$LOG"
 
-  # Cheap cadence: 3 s only while the screen is on and the pack is discharging.
-  if [ "$screen" = "1" ] && { [ "$status" = "3" ] || [ "$status" = "4" ]; }; then
+  # Sample every 3 s throughout discharge, including while the screen is off.
+  if [ "$status" = "3" ] || [ "$status" = "4" ]; then
     interval=3
   else
     interval=15

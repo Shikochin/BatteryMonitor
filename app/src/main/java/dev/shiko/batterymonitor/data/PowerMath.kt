@@ -48,9 +48,9 @@ internal data class TimeInterval(
  * Constants and small helpers shared by the data layer.
  *
  * The maths follow Scene 9.4.18 (`Analyser-Power` + the SQL queries on its `records` table):
- *  - samples are only taken while **discharging and the screen is on**,
+ *  - battery/chart samples are taken every 3 s while discharging, regardless of screen state,
  *  - average power is `avg(current × voltage)`,
- *  - "已使用" is `sampleCount × 3 s`,
+ *  - screen-on and screen-off duration/power summaries are tracked independently,
  *  - runtime is `remainingWh / avgPower × 0.9`,
  *  - capacity is `chargeFull_mAh × 3.86 V` (×2 for small dual-cell packs).
  */
@@ -58,6 +58,9 @@ internal object PowerMath {
 
     /** Sampling/tick cadence; Scene records every 1–3 s and treats a record as 3 s. */
     const val TICK_INTERVAL_MILLIS = 3_000L
+
+    /** Battery/chart sampling cadence while the screen is off. */
+    const val SCREEN_OFF_TICK_INTERVAL_MILLIS = TICK_INTERVAL_MILLIS
 
     /** "使用过程" chart viewport: the visible slice of the curve. */
     const val CHART_WINDOW_MILLIS = 45 * 60_000L
@@ -107,6 +110,14 @@ internal object PowerMath {
     /** `true` when the gap between two samples is long enough to count as "not recorded". */
     fun isMissedRecord(gapMillis: Long, thresholdMillis: Long = MISSED_GAP_MILLIS): Boolean =
         gapMillis > thresholdMillis
+
+    /** Time-weighted average from Σ(power_mW × elapsed_ms), negative while discharging. */
+    fun averageDischargePowerWatts(weightedPowerMilliWattMillisSum: Double, durationMillis: Long): Float {
+        if (durationMillis <= 0L) return 0f
+        return (-weightedPowerMilliWattMillisSum / durationMillis / 1000.0)
+            .toFloat()
+            .takeIf { it.isFinite() } ?: 0f
+    }
 
     /** `chargeFull_mAh × 3.86 V`, doubled for packs that look like a single cell of a dual pack. */
     fun fullCapacityWattHours(

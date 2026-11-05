@@ -31,16 +31,16 @@ data class BatterySnapshot(
 
 /** How a section of the usage curve was recorded, mirroring Scene's chart legend. */
 enum class ChartSegmentStyle {
-    /** Solid blue: the screen was on and battery state was recorded. */
+    /** Solid blue: the segment starts while the screen is on and recording is current. */
     ScreenOn,
 
-    /** Solid grey: the screen was off and battery state was recorded. */
+    /** Solid grey: the segment starts while the screen is off and recording is current. */
     ScreenOff,
 
-    /** Dotted blue: screen on, but the recorder was asleep and missed the planned tick. */
+    /** Dotted blue: screen on, but the recorder missed the next planned tick. */
     MissedRecordScreenOn,
 
-    /** Dotted grey: screen off, recording paused. */
+    /** Dotted grey: screen off, but the recorder missed the next planned tick. */
     MissedRecordScreenOff,
 }
 
@@ -105,6 +105,7 @@ enum class DaemonState { UNKNOWN, RUNNING, STOPPED }
 data class PowerUiState(
     val snapshot: BatterySnapshot? = null,
     val summary: PowerSummary = PowerSummary(0f, 0L, 0L),
+    val screenOffSummary: PowerSummary = PowerSummary(0f, 0L, 0L),
     val chartSamples: List<ChartSample> = emptyList(),
     val scenarios: List<UsageScenario> = emptyList(),
     /** Width of the chart window in ms (e.g. 45 minutes). */

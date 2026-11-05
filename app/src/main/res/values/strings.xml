@@ -40,6 +40,12 @@
     <string name="summary_average_power">Avg. power</string>
     <string name="summary_used">Used</string>
     <string name="summary_estimated_runtime">Est. runtime</string>
+    <string name="summary_screen_on_average_power">On avg. power</string>
+    <string name="summary_screen_off_average_power">Off avg. power</string>
+    <string name="summary_screen_on_time">On time</string>
+    <string name="summary_screen_off_time">Off time</string>
+    <string name="summary_screen_on_estimated_runtime">On runtime</string>
+    <string name="summary_screen_off_estimated_runtime">Off runtime</string>
 
     <!-- Legend -->
     <string name="legend_title">Help</string>
