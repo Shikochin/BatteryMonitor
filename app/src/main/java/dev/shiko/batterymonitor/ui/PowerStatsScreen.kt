@@ -203,8 +203,7 @@ fun PowerStatsScreen(
                     )
                     UsageScenarioCard(
                         scenarios = state.scenarios,
-                        // Shizuku is the only data source: without the grant the card shows "去授权"
-                        // instead of an (empty) list.
+                        // A Shizuku or direct-root grant is required: without one the card asks for access.
                         needsShizuku = !state.shizukuGranted,
                         loading = state.loadingScenarios,
                         onRequestShizuku = onRequestShizuku,
@@ -213,6 +212,7 @@ fun PowerStatsScreen(
                     DataSourceRow(
                         shizukuGranted = state.shizukuGranted,
                         rootAvailable = state.rootAvailable,
+                        rootProviderLabel = state.rootProviderLabel,
                         shizukuAvailable = state.shizukuAvailable,
                         daemonState = state.daemonState,
                         daemonRestarting = state.daemonRestarting,
@@ -274,13 +274,14 @@ fun PowerStatsScreen(
 private fun DataSourceRow(
     shizukuGranted: Boolean,
     rootAvailable: Boolean,
+    rootProviderLabel: String?,
     shizukuAvailable: Boolean,
     daemonState: DaemonState,
     daemonRestarting: Boolean,
     onRestartDaemon: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val source = stringResource(
+    val source = rootProviderLabel.takeIf { shizukuGranted && rootAvailable } ?: stringResource(
         when {
             // root reads continuous sysfs current; plain shell can only see `dumpsys battery`.
             shizukuGranted && rootAvailable -> R.string.data_source_root

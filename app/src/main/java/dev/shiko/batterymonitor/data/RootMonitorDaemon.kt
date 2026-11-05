@@ -124,8 +124,9 @@ internal class RootMonitorDaemon(context: Context) {
     /**
      * Starts the daemon when it is not already the single healthy instance.
      *
-     * Requires root Shizuku (uid 0): the battery sysfs nodes are not readable by the shell uid on
-     * this ROM. Returns `true` only when the process table was re-checked afterwards and shows
+     * Requires a root-capable command channel (Shizuku uid 0 or direct `su`): the battery sysfs
+     * nodes are not readable by the shell uid on this ROM. Returns `true` only when the process
+     * table was re-checked afterwards and shows
      * exactly one sampler with a fresh heartbeat.
      */
     @Synchronized

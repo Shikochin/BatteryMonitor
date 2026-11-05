@@ -5,10 +5,11 @@
 
 ## 数据来源
 
-只走 Shizuku / Sui：启动即请求权限。Sui 以 root 运行时（`Shizuku.getUid() == 0`）优先读
-`/sys/class/power_supply/`（`current_now` / `voltage_now` / `capacity` / `temp` / `charge_full`，
-即 Scene 用的 sysfs 来源）；只有 shell 身份时退回 `dumpsys battery`；逐应用统计始终用
-`dumpsys batterystats`。
+优先尝试应用自身的 `su -c` 直授 root，KernelSU 通过 `ksud debug version` 的 `Kernel Version:`
+字段识别版本，Magisk 通过 `magisk -v` 获取版本；没有直授 root
+时使用 Shizuku。root 模式优先读 `/sys/class/power_supply/`（`current_now` / `voltage_now` /
+`capacity` / `temp` / `charge_full`，即 Scene 用的 sysfs 来源）；只有 shell 身份时退回
+`dumpsys battery`；逐应用统计始终用 `dumpsys batterystats`。
 
 ## 算法与口径
 
@@ -32,7 +33,7 @@
 ### 后台守护进程
 
 App 自身的进程在后台会被系统冻结（ColorOS 上约 10 秒后 `cgroup.freeze=1`），因此每 3 秒的采样循环由
-Shizuku 以 root 启动的独立 `sh` 守护进程完成：它把采样追加到
+root 通道启动的独立 `sh` 守护进程完成：它把采样追加到
 `files/monitor/samples.log`，App 回到前台后按偏移增量读取并套用上面的规则。
 守护进程与 App 进程解耦，App 被冻结或杀掉都不会中断记录。
 
@@ -42,15 +43,17 @@ Shizuku 以 root 启动的独立 `sh` 守护进程完成：它把采样追加到
 所以每次读数都按 µA/mA/0.1 mA 三种解释算功率，再与充电计数器的 ΔWh/Δt（≥5 s 窗口）比对，
 取比值 0.33–3 内最接近的那个；超界读数直接丢弃，不夹逼、不入库。
 
-界面底部显示 `数据来源：Shizuku (root) · 守护进程运行中` 或 `Shizuku (shell)`。
+界面底部显示实际来源，例如 `数据来源：KernelSU(32716) · 守护进程运行中`、
+`Magisk(版本)`、`Shizuku (root)` 或 `Shizuku (shell)`。
 
 > 本机实测（OnePlus PLZ110 / Android 17 / 7500 mAh）：root 模式下瞬时功率 −0.74 W、
 > 平均功耗 1.36 W、理论续航 16h52m、哔哩哔哩逐应用 2.55 W —— 与 Scene 同量级（其对照片 2.03 W / 2.69 W）。
 
 ## 权限
 
-- **Shizuku / Sui**：必需。安装并激活 Shizuku（或使用 Sui 这类 root 模块）后，应用启动会自动弹出授权请求。
-- **root（可选）**：在 Sui 里给本应用 root 权限后，瞬时功率/电压走 sysfs，跟上屏幕负载变化；
+- **Shizuku 或直授 root**：二选一。应用会优先尝试 KernelSU / Magisk 的 `su` 授权；如果没有，
+  则在 Shizuku 可用时请求授权。
+- **root 模式**：瞬时功率/电压走 sysfs，跟上屏幕负载变化；
   只有 shell 权限时用充电计数器估算（≥5 s 窗口，粒度 1 mAh），数值更保守。
 - 只申请 `QUERY_ALL_PACKAGES`，没有网络权限。
 
@@ -104,7 +107,8 @@ app/src/main/java/dev/shiko/batterymonitor/
 ├── model/Models.kt                  # BatterySnapshot / ChartSample / UsageScenario / PowerUiState …
 ├── data/
 │   ├── PowerStatsRepository.kt      # 聚合状态，采样 / 图表 / 场景的统一出口
-│   ├── RootMonitorDaemon.kt         # Shizuku root 守护进程的启动与采样日志读取
+│   ├── RootMonitorDaemon.kt         # root 守护进程的启动与采样日志读取
+│   ├── DirectRootBridge.kt          # KernelSU / Magisk 的 su 检测与命令执行
 │   ├── SysfsBatterySource.kt        # sysfs 电池节点解析
 │   ├── ShizukuBridge.kt             # Shizuku 服务检测、授权、exec
 │   ├── SystemBatteryStatsSource.kt  # dumpsys battery / batterystats 解析

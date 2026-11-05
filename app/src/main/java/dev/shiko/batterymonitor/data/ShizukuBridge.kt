@@ -8,9 +8,8 @@ import moe.shizuku.server.IShizukuService
 /**
  * Thin, crash-proof wrapper around the Shizuku API.
  *
- * Shizuku lets an app talk to the "shell" (uid 2000) / root service that the user started, which
- * is what makes `dumpsys battery` and `dumpsys batterystats` readable — i.e. the system's own
- * accounting instead of a reconstruction from public telemetry.
+ * Shizuku lets an app talk to the "shell" (uid 2000) / root service that the user started. Direct
+ * root via KernelSU/Magisk is handled by [DirectRootBridge] and is preferred for each command.
  *
  * Every call is defensive: the Shizuku binder can disappear at any moment (user stops the service,
  * Shizuku is force-stopped, the device reboots) and the API throws `IllegalStateException` /
@@ -45,6 +44,7 @@ internal object ShizukuBridge {
      * (Sui via KernelSU/Magisk), `2000` means shell-only. `null` when the service is not running.
      */
     fun serverUid(): Int? {
+        if (DirectRootBridge.isAvailable()) return 0
         if (!isServiceAvailable()) return null
         return try {
             Shizuku.getUid()
@@ -55,6 +55,7 @@ internal object ShizukuBridge {
 
     /** `true` when the service is alive and this app has been granted Shizuku access. */
     fun hasPermission(): Boolean {
+        if (DirectRootBridge.isAvailable()) return true
         if (!isServiceAvailable()) return false
         return try {
             Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
@@ -118,6 +119,7 @@ internal object ShizukuBridge {
      * including a timeout, so a broken Shizuku never breaks the caller.
      */
     fun exec(command: String, timeoutMillis: Long = EXEC_TIMEOUT_MILLIS): String? {
+        DirectRootBridge.exec(command, timeoutMillis)?.let { return it }
         if (!hasPermission()) return null
         return try {
             execute(command, timeoutMillis)

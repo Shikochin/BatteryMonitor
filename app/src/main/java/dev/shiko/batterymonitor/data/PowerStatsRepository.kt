@@ -42,9 +42,10 @@ import kotlin.math.abs
  *  - `使用场景` = the same samples grouped per foreground package (no UID/whole-device fallback),
  *  - the chart breaks into dotted segments when the gap between samples exceeds 10 s.
  *
- * Data comes from Shizuku: sysfs when the service runs as root (Sui/KernelSU), `dumpsys battery`
- * otherwise, and `dumpsys batterystats` for the foreground intervals, the learned capacity and the
- * chart history seed. Without the permission there is no data at all (snapshot `null`, summary 0).
+ * Data comes from direct root (`su`, including KernelSU/Magisk) when available, or Shizuku: sysfs
+ * when the service runs as root, `dumpsys battery` otherwise, and `dumpsys batterystats` for the
+ * foreground intervals, learned capacity and chart history seed. Without either grant there is no
+ * data (snapshot `null`, summary 0).
  */
 class PowerStatsRepository(context: Context) {
 
@@ -129,6 +130,7 @@ class PowerStatsRepository(context: Context) {
     private var shizukuAvailable: Boolean = false
     private var shizukuGranted: Boolean = false
     private var rootAvailable: Boolean = false
+    private var rootProviderLabel: String? = null
     /** Consecutive ticks where the sysfs read failed while root was assumed. */
     private var sysfsFailureStreak: Int = 0
     private var shizukuPermissionRequested: Boolean = false
@@ -233,8 +235,18 @@ class PowerStatsRepository(context: Context) {
 
         lastPermissionCheckMillis = System.currentTimeMillis()
         refreshShizukuFlags()
-        maybeRequestShizukuPermissionUpFront()
-        maintainDaemon(force = true)
+        scope.launch {
+            val provider = withContext(Dispatchers.IO) { DirectRootBridge.detect() }
+            refreshShizukuFlags()
+            if (provider != null) {
+                requestBatteryReading(force = true)
+                restartStatsPipeline(showLoading = true)
+                maintainDaemon(force = true)
+                publish()
+            } else {
+                maybeRequestShizukuPermissionUpFront()
+            }
+        }
         DaemonWatchdog.schedule(appContext)
 
         requestBatteryReading(screenStateOverride = null, force = true)
@@ -410,6 +422,7 @@ class PowerStatsRepository(context: Context) {
             shizukuGranted = granted
             shizukuAvailable = !granted && ShizukuBridge.isServiceAvailable()
             rootAvailable = granted && ShizukuBridge.serverUid() == 0
+            rootProviderLabel = DirectRootBridge.provider()?.label()
             if (granted) {
                 requestBatteryReading(force = true)
                 restartStatsPipeline(showLoading = true)
@@ -421,6 +434,13 @@ class PowerStatsRepository(context: Context) {
 
     /** Reads the Shizuku flags (and whether the service runs as root) without publishing. */
     private fun refreshShizukuFlags() {
+        rootProviderLabel = DirectRootBridge.provider()?.label()
+        if (DirectRootBridge.isAvailable()) {
+            shizukuGranted = true
+            shizukuAvailable = false
+            rootAvailable = true
+            return
+        }
         val available = runCatching { ShizukuBridge.isServiceAvailable() }.getOrDefault(false)
         val granted = available && runCatching { ShizukuBridge.hasPermission() }.getOrDefault(false)
         shizukuGranted = granted
@@ -1700,6 +1720,7 @@ class PowerStatsRepository(context: Context) {
                 shizukuGranted = shizukuGranted,
                 shizukuAvailable = shizukuAvailable,
                 rootAvailable = rootAvailable,
+                rootProviderLabel = rootProviderLabel,
                 daemonState = daemonState,
                 daemonRestarting = daemonRestartInFlight,
             )

@@ -127,6 +127,8 @@ data class PowerUiState(
     val shizukuAvailable: Boolean = false,
     /** True when the Shizuku shell actually runs as uid 0 (Sui/root), so sysfs is readable. */
     val rootAvailable: Boolean = false,
+    /** Direct root provider label, e.g. `KernelSU(32716)` or `Magisk(29.0)`. */
+    val rootProviderLabel: String? = null,
     /** Last verified state of the detached root sampler (collects while the app is frozen). */
     val daemonState: DaemonState = DaemonState.UNKNOWN,
     /** True while a manual "restart sampler" request is in flight. */
